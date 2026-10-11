@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# grok-bot-ensure-macos - UNTESTED macOS port of the Linux watchdog.
+# grok-bot-ensure-macos - macOS port of the Linux watchdog.
+# Daemon-down detection on macOS is not yet verified against a real drop.
 # Community-made; not affiliated with or endorsed by the app's vendor.
 #
 # Usage: grok-bot-ensure-macos [--check] [--dry-run] [--force]
 # Exit codes match the Linux script: 0 ok, 10 recovered, 11 deferred,
 # 12 dry-run, 2 usage, 4 app not found, 5 failed, 6 locked, 7 host mismatch;
-# --check: 0 healthy, 1 not healthy.
+# --check: 0 healthy, 1 not healthy. Paused exits 0.
+# --check and --dry-run are read-only: no lock, no state writes.
 set -uo pipefail
 DRY=0 FORCE=0 CHECK=0
 for a in "$@"; do
@@ -38,10 +40,20 @@ LOGDIR="$HOME/Library/Logs/grok-bot-watchdog"
 # Sunshine uses ~/.config/sunshine on macOS too (its log is sunshine.log there).
 : "${GBW_SUNSHINE_LOG:=$HOME/.config/sunshine/sunshine.log}"
 : "${GBW_DAEMON_FD_MARKER:=/terminals/[0-9]+\.txt$}"
-mkdir -p "$STATE" "$LOGDIR"
+RO=$(( CHECK || DRY ))
+(( RO )) || mkdir -p "$STATE" "$LOGDIR"
 LOG="$LOGDIR/ensure.log"
-log() { printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$*" >>"$LOG"; echo "$*"; }
+log() { (( RO )) || printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$*" >>"$LOG"; echo "$*"; }
+# Keep launchd's stdout/stderr files bounded.
+if (( ! RO )); then
+  for f in "$LOGDIR/launchd.out" "$LOGDIR/launchd.err" "$LOG"; do
+    if [[ -f "$f" ]] && (( $(wc -l <"$f") > 1000 )); then
+      tail -n 1000 "$f" >"$f.tmp" && cat "$f.tmp" >"$f" && rm -f "$f.tmp"
+    fi
+  done
+fi
 notify() {
+  (( RO )) && return 0
   local m="${1//\\/\\\\}"; m="${m//\"/\\\"}"
   osascript -e "display notification \"$m\" with title \"Grok Bot watchdog\"" >/dev/null 2>&1 || true
 }
@@ -52,7 +64,8 @@ fi
 
 # mkdir lock with owner PID + age check so a crashed run can't wedge it.
 LOCK="$STATE/lock.d"
-if ! mkdir "$LOCK" 2>/dev/null; then
+if (( RO )); then :
+elif ! mkdir "$LOCK" 2>/dev/null; then
   owner="$(cat "$LOCK/pid" 2>/dev/null || echo)"
   age=$(( $(date +%s) - $(stat -f %m "$LOCK" 2>/dev/null || date +%s) ))
   if [[ -n "$owner" ]] && kill -0 "$owner" 2>/dev/null && (( age < 600 )); then
@@ -60,11 +73,13 @@ if ! mkdir "$LOCK" 2>/dev/null; then
   fi
   rm -rf "$LOCK"; mkdir "$LOCK" || { echo "status=locked"; exit 6; }
 fi
-echo $$ >"$LOCK/pid"
-trap 'rm -rf "$LOCK"' EXIT
+if (( ! RO )); then
+  echo $$ >"$LOCK/pid"
+  trap 'rm -rf "$LOCK"' EXIT
+fi
 
 IFS=: read -r -a _p <<<"$GBW_PAUSE_FILES"
-for p in "${_p[@]}"; do [[ -n "$p" && -e "$p" ]] && { echo "status=paused file=$p"; (( CHECK )) && exit 0; exit 11; }; done
+for p in "${_p[@]}"; do [[ -n "$p" && -e "$p" ]] && { log "status=paused file=$p"; exit 0; }; done
 [[ -d "$GBW_APP_PATH" ]] || { echo "status=no_app ($GBW_APP_PATH)" >&2; exit 4; }
 BINDIR="$GBW_APP_PATH/Contents/MacOS"
 UID_="$(id -u)"
@@ -114,7 +129,7 @@ guard_blocks() {
   if (( GBW_GAME_GUARD )) && pgrep -U "$UID_" -f "$GBW_GAME_MATCH" >/dev/null; then why=game_running
   elif sunshine_streaming; then why=stream_active; fi
   if [[ -z "$why" ]]; then rm -f "$STATE/blocked-since" "$STATE/blocked-notified"; return 1; fi
-  if (( ! DRY )); then
+  if (( ! RO )); then
     [[ -s "$STATE/blocked-since" ]] || date +%s >"$STATE/blocked-since"
     since="$(cat "$STATE/blocked-since")"
     if [[ "$since" =~ ^[0-9]+$ ]] && (( $(date +%s) - since > GBW_BLOCK_NOTIFY )) && [[ ! -e "$STATE/blocked-notified" ]]; then
@@ -124,26 +139,34 @@ guard_blocks() {
   echo "$why"
 }
 record_relaunch() { date +%s >>"$STATE/relaunches"; tail -n 20 "$STATE/relaunches" >"$STATE/r.tmp" && mv "$STATE/r.tmp" "$STATE/relaunches"; }
-defer() { log "deferred: $1"; echo "status=deferred reason=$1"; exit 11; }
+defer() { log "status=deferred reason=$1"; exit 11; }
 
 BASE_F="$STATE/nodeservice-baseline"
-if probe; then
-  echo 0 >"$STATE/fails"; rm -f "$STATE/cap-notified"
-  echo "$NS $M $(instance_id "$M")" >"$BASE_F"
-  echo "status=ok main=$M daemon=$D"; exit 0
+probe; healthy=$?
+# Baseline = most NodeService children seen for THIS instance (pid + lstart),
+# updated on every run while the app is up (busy or idle).
+base=0 b_count=""
+if [[ -n "$M" ]]; then
+  inst="$(instance_id "$M")"
+  if [[ -r "$BASE_F" ]]; then read -r b_count b_pid b_inst <"$BASE_F" || true; fi
+  [[ "${b_count:-}" =~ ^[0-9]+$ && "${b_pid:-}" == "$M" && -n "$inst" && "${b_inst:-}" == "$inst" ]] && base=$b_count
+  (( RO )) || echo "$(( NS > base ? NS : base )) $M $inst" >"$BASE_F"
+fi
+if (( healthy == 0 )); then
+  (( RO )) || { echo 0 >"$STATE/fails"; rm -f "$STATE/cap-notified"; }
+  echo "status=ok main=$M daemon=$D nodeservice=$NS baseline=$base"; exit 0
 fi
 if [[ -n "$M" ]]; then
-  base=0; read -r b_count b_pid b_inst <"$BASE_F" 2>/dev/null || true
-  [[ "${b_count:-}" =~ ^[0-9]+$ && "${b_pid:-}" == "$M" && "${b_inst:-}" == "$(instance_id "$M")" ]] && base=$b_count
+  b_count=$base
   if (( base == 0 || NS >= base )); then
-    echo 0 >"$STATE/fails"; echo "status=ok_idle main=$M nodeservice=$NS baseline=$base"; exit 0
+    (( RO )) || echo 0 >"$STATE/fails"; echo "status=ok_idle main=$M nodeservice=$NS baseline=$base"; exit 0
   fi
   reason=daemon_down
 else
   reason=app_down
 fi
 (( CHECK )) && { echo "status=unhealthy reason=$reason"; exit 1; }
-[[ $reason == app_down && "$GBW_RELAUNCH_IF_MAIN_DOWN" != 1 ]] && { echo "status=deferred reason=app_down"; exit 11; }
+[[ $reason == app_down && "$GBW_RELAUNCH_IF_MAIN_DOWN" != 1 ]] && defer app_down
 
 fails=$(( $(cat "$STATE/fails" 2>/dev/null || echo 0) + 1 ))
 (( DRY )) || echo "$fails" >"$STATE/fails"
@@ -159,7 +182,7 @@ if [[ -f "$STATE/relaunches" ]]; then
 fi
 if (( FORCE == 0 )); then
   if (( recent >= GBW_CAP )); then
-    [[ -e "$STATE/cap-notified" ]] || { notify "Relaunch cap hit; backing off."; touch "$STATE/cap-notified"; }
+    [[ -e "$STATE/cap-notified" ]] || (( RO )) || { notify "Relaunch cap hit; backing off."; touch "$STATE/cap-notified"; }
     defer cap
   fi
   (( recent > 0 && now - last < GBW_BACKOFF_BASE * (1 << (recent - 1)) )) && defer backoff

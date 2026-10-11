@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# UNTESTED macOS installer.  ./install.sh [--uninstall|--purge]
+# macOS installer.  ./install.sh [--uninstall|--purge]
+#   --uninstall  remove the LaunchAgent and script, keep config/state/logs
+#   --purge      also delete config, state and logs
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 label=com.github.grok-bot-watchdog
@@ -16,7 +18,7 @@ case "${1:-}" in
 esac
 mkdir -p "$HOME/.local/bin" "$HOME/Library/LaunchAgents" "$HOME/Library/Logs/grok-bot-watchdog" "$conf"
 install -m 0755 "$here/grok-bot-ensure-macos" "$HOME/.local/bin/"
-[[ -e "$conf/config" ]] || install -m 0644 "$here/../linux/config.example" "$conf/config"
+[[ -e "$conf/config" ]] || install -m 0644 "$here/config.example" "$conf/config"
 sed "s#__HOME__#$HOME#g" "$here/$label.plist" >"$plist"
 launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
 launchctl bootstrap "gui/$(id -u)" "$plist"

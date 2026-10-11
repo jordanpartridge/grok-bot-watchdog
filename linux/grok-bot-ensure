@@ -9,15 +9,16 @@
 #   --force    skip debounce / backoff / cap (never skips the game/stream guard)
 #
 # Exit codes (normal mode):
-#   0  healthy (or idle with no evidence of a drop) - nothing done
+#   0  healthy (or idle with no evidence of a drop), or paused - nothing done
 #   10 was unhealthy, recovered by relaunch
-#   11 unhealthy but deferred (paused, debounce, game/stream, backoff, cap,
+#   11 unhealthy but deferred (debounce, game/stream, backoff, cap,
 #      clean app exit, app-down handling disabled)
 #   12 dry-run: would have acted
 #   2  usage / config error      3  no graphical session found
 #   4  app binary not found      5  relaunch attempted, still unhealthy
 #   6  another instance running  7  host does not match GBW_HOST_REGEX
 #
+# --check and --dry-run are read-only: no lock, no state writes.
 # Safe over SSH (discovers the session env itself), idempotent, never needs root.
 set -uo pipefail
 
@@ -66,14 +67,15 @@ if [[ -r "$CONF" ]]; then . "$CONF" || { echo "bad config: $CONF" >&2; exit 2; }
 : "${GBW_BLOCK_NOTIFY:=1800}"             # notify once when a guard blocks longer than this
 
 UID_="$(id -u)"
-mkdir -p "$STATE"
+RO=$(( CHECK || DRY ))   # read-only modes: no lock, no state writes
+(( RO )) || mkdir -p "$STATE"
 LOG="$STATE/ensure.log"
 ts()  { date '+%Y-%m-%dT%H:%M:%S%z'; }
-log() { printf '%s %s\n' "$(ts)" "$*" >>"$LOG"; printf '%s\n' "$*"; }
+log() { (( RO )) || printf '%s %s\n' "$(ts)" "$*" >>"$LOG"; printf '%s\n' "$*"; }
 dbg() { (( VERBOSE )) && printf 'debug: %s\n' "$*" >&2; return 0; }
 re_escape() { printf '%s' "$1" | sed 's/[][\.^$*+?(){}|/]/\\&/g'; }
 notify() {
-  (( GBW_NOTIFY )) || return 0
+  (( GBW_NOTIFY && ! RO )) || return 0
   command -v notify-send >/dev/null 2>&1 && notify-send -a grok-bot-watchdog "Grok Bot watchdog" "$1" >/dev/null 2>&1
   return 0
 }
@@ -83,11 +85,13 @@ if [[ -n "$GBW_HOST_REGEX" ]]; then
   host="$(hostname -s 2>/dev/null || hostname)"
   [[ "$host" =~ $GBW_HOST_REGEX ]] || { echo "refuse: host does not match GBW_HOST_REGEX" >&2; exit 7; }
 fi
-exec 9>"$STATE/lock"
-flock -n 9 || { echo "status=locked"; exit 6; }
+if (( ! RO )); then
+  exec 9>"$STATE/lock"
+  flock -n 9 || { echo "status=locked"; exit 6; }
+fi
 IFS=: read -r -a _pauses <<<"$GBW_PAUSE_FILES"
 for p in "${_pauses[@]}"; do
-  [[ -n "$p" && -e "$p" ]] && { echo "status=paused file=$p"; (( CHECK )) && exit 0; exit 11; }
+  [[ -n "$p" && -e "$p" ]] && { log "status=paused file=$p"; exit 0; }
 done
 
 # ---- locate the app ---------------------------------------------------------
@@ -196,7 +200,7 @@ guard_blocks() {
   if game_running; then why=game_running
   elif stream_active; then why=stream_active; fi
   if [[ -z "$why" ]]; then rm -f "$STATE/blocked-since" "$STATE/blocked-notified"; return 1; fi
-  if (( ! DRY )); then
+  if (( ! RO )); then
     [[ -s "$STATE/blocked-since" ]] || date +%s >"$STATE/blocked-since"
     since="$(cat "$STATE/blocked-since" 2>/dev/null)"
     if [[ "$since" =~ ^[0-9]+$ ]] && (( $(date +%s) - since > GBW_BLOCK_NOTIFY )) && [[ ! -e "$STATE/blocked-notified" ]]; then
@@ -355,28 +359,35 @@ proc_starttime() {
   local s; s="$(cat "/proc/$1/stat" 2>/dev/null)" || return 1
   s="${s##*) }"; read -r -a f <<<"$s"; echo "${f[19]}"
 }
-if probe; then
-  echo 0 >"$FAILS_F"; rm -f "$STATE/cap-notified"
-  # baseline line: <nodeservice count> <main pid> <main starttime>
-  [[ -n "$MAIN" ]] && echo "$NS_COUNT $MAIN $(proc_starttime "$MAIN")" >"$BASE_F"
-  echo "status=ok main=$MAIN daemon=$DAEMON via=$HOW"
+probe; healthy=$?
+# Baseline = the most NodeService children seen for THIS app instance
+# (line: <max count> <main pid> <main starttime>). It is updated on every run
+# while the app is up, whether or not the daemon is busy, and is ignored for
+# any other instance.
+base=0 b_count=""
+if [[ -n "$MAIN" ]]; then
+  cur_start="$(proc_starttime "$MAIN")"
+  if [[ -r "$BASE_F" ]]; then read -r b_count b_pid b_start <"$BASE_F" || true; fi
+  if [[ "${b_count:-}" =~ ^[0-9]+$ && "${b_pid:-}" == "$MAIN" && -n "$cur_start" && "${b_start:-}" == "$cur_start" ]]; then
+    base=$b_count
+  fi
+  newbase=$(( NS_COUNT > base ? NS_COUNT : base ))
+  (( RO )) || echo "$newbase $MAIN $cur_start" >"$BASE_F"
+fi
+if (( healthy == 0 )); then
+  (( RO )) || { echo 0 >"$FAILS_F"; rm -f "$STATE/cap-notified"; }
+  echo "status=ok main=$MAIN daemon=$DAEMON via=$HOW nodeservice=$NS_COUNT baseline=$base"
   exit 0
 fi
 
 if [[ -z "$MAIN" ]]; then
   reason=app_down
 else
-  # No marker right now. The daemon can be idle (no shells, no open files),
-  # so only call it down if the app lost a NodeService child since the last
-  # time the daemon was positively identified.
-  # The baseline only applies to the same app instance (pid + start time).
-  base=0; read -r b_count b_pid b_start <"$BASE_F" 2>/dev/null || true
-  if [[ "${b_count:-}" =~ ^[0-9]+$ && "${b_pid:-}" == "$MAIN" && -n "${b_start:-}" &&
-        "$b_start" == "$(proc_starttime "$MAIN")" ]]; then
-    base=$b_count
-  fi
+  # No marker right now; the daemon can be idle (no shells, no open files),
+  # so only call it down if this instance lost a NodeService child.
+  b_count=$base
   if (( base == 0 || NS_COUNT >= base )); then
-    echo 0 >"$FAILS_F"
+    (( RO )) || echo 0 >"$FAILS_F"
     echo "status=ok_idle main=$MAIN nodeservice=$NS_COUNT baseline=$base (no marker; no evidence of a drop)"
     exit 0
   fi
@@ -386,11 +397,11 @@ fi
 
 if [[ "$reason" == app_down ]]; then
   if [[ "$GBW_RELAUNCH_IF_MAIN_DOWN" != 1 ]]; then
-    echo "status=deferred reason=app_down (GBW_RELAUNCH_IF_MAIN_DOWN=0)"; exit 11
+    log "status=deferred reason=app_down (GBW_RELAUNCH_IF_MAIN_DOWN=0)"; exit 11
   fi
   # Electron removes SingletonLock on a clean quit; a leftover lock means a crash/kill.
   if [[ ! -L "$GBW_APP_DATA/SingletonLock" ]]; then
-    echo "status=deferred reason=clean_exit (app was quit intentionally)"; exit 11
+    log "status=deferred reason=clean_exit (app was quit intentionally)"; exit 11
   fi
 fi
 
@@ -398,11 +409,11 @@ fails=$(( $(cat "$FAILS_F" 2>/dev/null || echo 0) + 1 ))
 (( DRY )) || echo "$fails" >"$FAILS_F"
 if (( fails < GBW_DEBOUNCE && FORCE == 0 && DRY == 0 )); then
   log "unhealthy reason=$reason check=$fails/$GBW_DEBOUNCE - waiting for next run"
-  echo "status=deferred reason=debounce"; exit 11
+  log "status=deferred reason=debounce"; exit 11
 fi
 if why="$(guard_blocks)"; then
   log "unhealthy reason=$reason but $why - not relaunching"
-  echo "status=deferred reason=$why"; exit 11
+  log "status=deferred reason=$why"; exit 11
 fi
 
 # relaunch cap + exponential backoff
@@ -422,12 +433,12 @@ if (( FORCE == 0 )); then
       notify "Local-exec daemon keeps dropping; relaunch cap ($GBW_CAP/${GBW_CAP_WINDOW}s) hit. Watchdog is backing off."
       touch "$STATE/cap-notified"
     fi
-    echo "status=deferred reason=cap"; exit 11
+    log "status=deferred reason=cap"; exit 11
   fi
   if (( recent > 0 )); then
     wait_s=$(( GBW_BACKOFF_BASE * (1 << (recent - 1)) ))
     if (( now - last < wait_s )); then
-      echo "status=deferred reason=backoff next_in=$(( wait_s - (now - last) ))s"; exit 11
+      log "status=deferred reason=backoff next_in=$(( wait_s - (now - last) ))s"; exit 11
     fi
   fi
 fi
@@ -448,11 +459,11 @@ log "recover: reason=$reason session=$SESSION"
 
 # Tier 1: graceful stop (if running) + relaunch with a fixed env.
 if [[ "$reason" == daemon_down ]]; then
-  if why="$(guard_blocks)"; then log "abort before stop: $why"; echo "status=deferred reason=$why"; exit 11; fi
+  if why="$(guard_blocks)"; then log "abort before stop: $why"; log "status=deferred reason=$why"; exit 11; fi
   stop_app_graceful || log "graceful stop timed out"
 fi
 if [[ -z "$(main_pids)" ]]; then
-  if why="$(guard_blocks)"; then log "abort before launch: $why"; echo "status=deferred reason=$why"; exit 11; fi
+  if why="$(guard_blocks)"; then log "abort before launch: $why"; log "status=deferred reason=$why"; exit 11; fi
   launch_app || { echo "status=failed reason=launch_refused" >&2; exit 5; }
 fi
 if wait_healthy; then
@@ -460,12 +471,12 @@ if wait_healthy; then
 fi
 
 # Tier 2: hard relaunch. Re-check the guards right before the kill.
-if why="$(guard_blocks)"; then log "abort before hard kill: $why"; echo "status=deferred reason=$why"; exit 11; fi
+if why="$(guard_blocks)"; then log "abort before hard kill: $why"; log "status=deferred reason=$why"; exit 11; fi
 log "tier1 failed; hard relaunch"
 mapfile -t all < <(app_pids)
 ((${#all[@]})) && kill -KILL "${all[@]}" 2>/dev/null
 sleep 2
-if why="$(guard_blocks)"; then log "abort before launch: $why"; echo "status=deferred reason=$why"; exit 11; fi
+if why="$(guard_blocks)"; then log "abort before launch: $why"; log "status=deferred reason=$why"; exit 11; fi
 launch_app || { echo "status=failed reason=launch_refused" >&2; exit 5; }
 if wait_healthy; then
   echo 0 >"$FAILS_F"; log "recovered (tier2 hard)"; echo "status=recovered reason=$reason tier=hard"; exit 10

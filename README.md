@@ -31,7 +31,9 @@ daemon** has dropped and brings it back.
    `GBW_DAEMON_MATCH`.
    - marker found -> **healthy, nothing is touched**; the number of
      NodeService children is remembered as a baseline together with the
-     main PID and its start time (`/proc/PID/stat` field 22);
+     main PID and its start time (`/proc/PID/stat` field 22). The baseline
+     is the most children seen for that instance and is updated on every
+     run while the app is up, busy or idle;
    - no marker but no NodeService child lost since the baseline ->
      `ok_idle`, nothing is touched (an idle daemon has no marker);
    - fewer NodeService children than the baseline **of the same app
@@ -69,9 +71,9 @@ daemon** has dropped and brings it back.
 
 | code | meaning |
 |-----:|---------|
-| 0  | healthy / idle, nothing done |
+| 0  | healthy / idle / paused, nothing done |
 | 10 | was unhealthy, recovered |
-| 11 | unhealthy but deferred (paused, debounce, game, stream, backoff, cap, clean exit, app-down disabled) |
+| 11 | unhealthy but deferred (debounce, game, stream, backoff, cap, clean exit, app-down disabled) |
 | 12 | `--dry-run`: would have acted |
 | 2  | usage or config error |
 | 3  | no graphical session found |
@@ -81,7 +83,9 @@ daemon** has dropped and brings it back.
 | 7  | hostname does not match `GBW_HOST_REGEX` |
 
 `--check` is report-only: `0` healthy (or paused), `1` not healthy
-(codes 2-7 still apply for errors). The service treats 10 and 11 as success.
+(codes 2-5 and 7 still apply for errors; it never takes the lock, so it
+never returns 6). `--check` and `--dry-run` are read-only: no lock, no
+state or log writes. The service treats 10 and 11 as success.
 
 ```sh
 grok-bot-ensure --check      # report only
@@ -107,9 +111,10 @@ access only to its state dir), `ProtectKernelTunables` and
 `RestrictSUIDSGID`. Previous script versions are kept under
 `~/.local/state/grok-bot-watchdog/previous/`, not next to your files.
 
-macOS (**untested**): `./macos/install.sh` installs a LaunchAgent running
+macOS: `./macos/install.sh` installs a LaunchAgent running
 `grok-bot-ensure-macos` every 300 s (pgrep/lsof detection, `open -g -a`,
-same guards, cap and backoff; logs in `~/Library/Logs/grok-bot-watchdog`).
+same guards, cap and backoff; logs in `~/Library/Logs/grok-bot-watchdog`, trimmed to the last 1000
+lines on each run; config template `macos/config.example`).
 It restarts the app when the daemon drops (same marker + per-instance
 baseline logic), and starts a missing app only when opted in. Its game
 guard also covers Steam games (`steamapps/common`), Wine/CrossOver/Whisky
@@ -121,7 +126,10 @@ on macOS as well.
 ```sh
 ./linux/install.sh --uninstall   # keep config and state
 ./linux/install.sh --purge       # also delete config and state
-./macos/install.sh --uninstall | --purge
+./macos/install.sh --uninstall   # macOS: remove LaunchAgent + script, keep config/state/logs
+./macos/install.sh --purge       # macOS: also delete ~/.config/grok-bot-watchdog,
+                                 #   ~/Library/Application Support/grok-bot-watchdog and
+                                 #   ~/Library/Logs/grok-bot-watchdog
 ```
 
 ## Limitations
@@ -141,7 +149,10 @@ on macOS as well.
   `/run/user/$UID`, `/tmp/.X11-unix` and `loginctl` instead of a donor
   process's environment. Run `grok-bot-ensure -v` outside the unit to see
   every signal.
-- Single-user, single-session only. The macOS version is untested.
+- Single-user, single-session only.
+- macOS: install, health check, idle detection, pause and guards were
+  exercised on a real Mac; daemon-down detection and recovery there have
+  not yet been verified against an actual daemon drop.
 
 ## License
 

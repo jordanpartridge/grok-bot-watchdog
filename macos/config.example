@@ -1,0 +1,19 @@
+# ~/.config/grok-bot-watchdog/config - sourced by grok-bot-ensure-macos (bash syntax).
+# Everything is optional; the values shown are the defaults.
+#GBW_HOST_REGEX=""                  # e.g. "^my-mac$": refuse to run elsewhere
+#GBW_PAUSE_FILES="$HOME/.config/grok-bot-watchdog/PAUSE:$HOME/Library/Application Support/grok-bot-watchdog/PAUSE"
+#GBW_APP_NAME="Grok Bot"
+#GBW_APP_PATH="/Applications/Grok Bot.app"
+#GBW_RELAUNCH_IF_MAIN_DOWN=0        # 1 = also start the app if it is not running at all
+#GBW_DAEMON_FD_MARKER='/terminals/[0-9]+\.txt$'
+#GBW_DEBOUNCE=2
+#GBW_BACKOFF_BASE=300               # seconds, doubles per recent relaunch
+#GBW_CAP=3
+#GBW_CAP_WINDOW=3600
+#GBW_TERM_WAIT=10
+#GBW_SETTLE=30
+#GBW_BLOCK_NOTIFY=1800              # notify once if a guard blocks a needed relaunch this long
+#GBW_GAME_GUARD=1
+#GBW_GAME_MATCH='/steamapps/common/|SteamLaunch|wine64-preloader|wineserver|/CrossOver\.app/|/Whisky\.app/|Battle\.net|EpicGamesLauncher|GOG Galaxy|Heroic|Prism ?Launcher|PrismLauncher'
+#GBW_STREAM_GUARD=1
+#GBW_SUNSHINE_LOG="$HOME/.config/sunshine/sunshine.log"
