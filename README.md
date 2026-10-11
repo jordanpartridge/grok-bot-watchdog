@@ -20,8 +20,9 @@ daemon** has dropped and brings it back.
 `grok-bot-ensure` runs every 5 minutes from a systemd **user** timer.
 
 1. **Find the app**: `/opt/Grok Bot/grok-bot` or `GBW_APP_BIN`. Processes
-   are matched by their real executable (`/proc/PID/exe`) and owner, never by
-   command-line text, so an editor or pager showing the path never counts.
+   are matched by owner and their real executable (`/proc/PID/exe`; inside
+   the hardened unit, where that link is unreadable, argv[0] must equal the
+   app path exactly), never by a command-line substring, so an editor or pager showing the path never counts.
 2. **Health check**: main process = app executable without a Chromium
    `--type=` flag. The daemon is the specific `node.mojom.NodeService`
    child that carries a local-exec marker: it has child processes (the
@@ -116,6 +117,8 @@ daemon-only restart has not been validated there.
   NodeService child compared with the last positive identification.
 - The daemon lives inside the app, so recovery restarts the whole app.
 - Game/stream guards are pattern-based and err on the side of not acting.
+- Inside the hardened unit the open-file marker may be unreadable; the
+  child-process marker and the NodeService baseline still work.
 - Single-user, single-session only. The macOS version is untested.
 
 ## License

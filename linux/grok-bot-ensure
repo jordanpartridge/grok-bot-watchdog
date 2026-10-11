@@ -104,12 +104,23 @@ APP="$(find_app)"
 COMM="$(basename "$APP" | cut -c1-15)"
 dbg "app=$APP"
 
-# All processes of THIS user whose executable is exactly $APP (not cmdline text,
-# so an editor or pager showing the string never counts).
+# Is PID an instance of $APP? Compare the real executable; when /proc/PID/exe
+# is unreadable (e.g. inside the hardened unit's user namespace) require argv[0]
+# to equal $APP exactly. Substring matches never count, so an editor or pager
+# showing the path is never mistaken for the app.
+is_app() {
+  local exe a0=""
+  if exe="$(readlink "/proc/$1/exe" 2>/dev/null)"; then
+    [[ "$exe" == "$APP" ]]; return
+  fi
+  IFS= read -r -d '' a0 <"/proc/$1/cmdline" 2>/dev/null
+  [[ "$a0" == "$APP" ]]
+}
+# All processes of THIS user that are the app (main + Chromium helpers).
 app_pids() {
   local p
   for p in $(pgrep -u "$UID_" -x -- "$(re_escape "$COMM")" 2>/dev/null); do
-    [[ "$(readlink "/proc/$p/exe" 2>/dev/null)" == "$APP" ]] && echo "$p"
+    is_app "$p" && echo "$p"
   done
 }
 cmdline() { tr '\0' ' ' <"/proc/$1/cmdline" 2>/dev/null; }
@@ -122,7 +133,7 @@ main_pids() {
 nodeservice_children() {
   local p
   for p in $(pgrep -u "$UID_" -P "$1" 2>/dev/null); do
-    [[ "$(readlink "/proc/$p/exe" 2>/dev/null)" == "$APP" ]] || continue
+    is_app "$p" || continue
     [[ "$(cmdline "$p")" == *"--utility-sub-type=node.mojom.NodeService"* ]] && echo "$p"
   done
 }
