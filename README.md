@@ -12,78 +12,111 @@ daemon** has dropped and brings it back.
   commands to the machine fail or time out.
 - The app window may still be open, but the background Node service that
   runs local commands has exited.
-- Often happens after a compositor restart, a suspend/resume, or when the
-  app was started from a shell that lacked the graphical session's env
-  (`WAYLAND_DISPLAY`, `DISPLAY`, `HYPRLAND_INSTANCE_SIGNATURE`, ...).
+- Often follows a compositor restart, suspend/resume, or starting the app
+  from a shell that lacked the graphical session's environment.
 
 ## How it works (Linux)
 
-`grok-bot-ensure` runs every 5 minutes from a systemd **user** timer:
+`grok-bot-ensure` runs every 5 minutes from a systemd **user** timer.
 
-1. Locates the app binary (`/opt/Grok Bot/grok-bot` or `GBW_APP_BIN`).
-2. Health check:
-   - main process = the app binary without a Chromium `--type=` flag;
-   - daemon = a `node.mojom.NodeService` utility child of the main process
-     (current builds), or any process matching `GBW_DAEMON_MATCH`
-     (default `local-exec-daemon`, for builds that run it standalone).
-   - Healthy -> exit 0. **It never restarts anything while healthy.**
-3. Unhealthy -> guards, in order: pause file, debounce (2 consecutive bad
-   checks by default), game guard (skips restarting a running app while a
-   Steam game / gamescope / SteamVR is active), relaunch cap (3 per hour).
-4. Discovers the session without hardcoding: borrows env from a live
-   compositor/app process in `/proc`, then fills gaps from sockets in
-   `/run/user/$UID` (`hypr/*/.socket.sock`, `wayland-*`, `bus`),
-   `/tmp/.X11-unix`, and `loginctl` (Hyprland, GNOME, KDE, sway, X11).
-5. Pushes that env into `systemctl --user` / dbus activation env, then
-   tier 1: graceful stop (SIGTERM, wait) and relaunch in its own scope;
-   tier 2: SIGKILL the whole app tree and relaunch.
+1. **Find the app**: `/opt/Grok Bot/grok-bot` or `GBW_APP_BIN`. Processes
+   are matched by their real executable (`/proc/PID/exe`) and owner, never by
+   command-line text, so an editor or pager showing the path never counts.
+2. **Health check**: main process = app executable without a Chromium
+   `--type=` flag. The daemon is the specific `node.mojom.NodeService`
+   child that carries a local-exec marker: it has child processes (the
+   shells it runs) or holds a terminal-output file open
+   (`GBW_DAEMON_FD_MARKER`). For builds that run a standalone daemon, set
+   `GBW_DAEMON_MATCH`.
+   - marker found -> **healthy, nothing is touched**; the number of
+     NodeService children is remembered as a baseline;
+   - no marker but no NodeService child lost since the baseline ->
+     `ok_idle`, nothing is touched (an idle daemon has no marker);
+   - fewer NodeService children than the baseline -> daemon down.
+3. **Guards** before any action: pause files, debounce (2 bad checks),
+   game guard (gamescope / SteamVR / a Steam game launched via `reaper`),
+   stream guard (an active Sunshine client per its log, or a connected peer
+   on the stream ports), exponential backoff (300 s, doubling), and a cap of
+   3 relaunches per hour with a desktop notification when it is hit. The
+   game/stream guard is re-checked right before the graceful stop, before
+   the tier-2 SIGKILL, and before every launch.
+4. **App not running**: left alone by default (`GBW_RELAUNCH_IF_MAIN_DOWN=0`).
+   When enabled, a clean quit (Electron removed its `SingletonLock`) is
+   still respected.
+5. **Session discovery** without hardcoding: environment of a live
+   compositor/app process, then sockets under `/run/user/$UID`
+   (`hypr/*/.socket.sock`, `wayland-*`, `bus`), `/tmp/.X11-unix`, and
+   `loginctl` (Hyprland, GNOME, KDE, sway, X11).
+6. **Recovery**: push the session env into the user manager; tier 1 =
+   SIGTERM, wait, relaunch; tier 2 = SIGKILL the app tree, relaunch. The app
+   is started with `systemd-run --user` (or `GBW_LAUNCH_CMD`), so it never
+   inherits the watchdog's sandbox and outlives it.
 
-Exit codes: `0` ok, `10` recovered, `11` deferred, `12` dry-run would act,
-`2` usage, `3` no session, `4` app not found, `5` failed, `6` locked.
+### Exit codes
 
-Safe over SSH, idempotent (flock + debounce), no root.
+| code | meaning |
+|-----:|---------|
+| 0  | healthy / idle, nothing done |
+| 10 | was unhealthy, recovered |
+| 11 | unhealthy but deferred (paused, debounce, game, stream, backoff, cap, clean exit, app-down disabled) |
+| 12 | `--dry-run`: would have acted |
+| 2  | usage or config error |
+| 3  | no graphical session found |
+| 4  | app binary not found |
+| 5  | relaunch attempted, still unhealthy |
+| 6  | another run holds the lock |
+| 7  | hostname does not match `GBW_HOST_REGEX` |
+
+`--check` is report-only: `0` healthy (or paused), `1` not healthy
+(codes 2-7 still apply for errors). The service treats 10 and 11 as success.
 
 ```sh
 grok-bot-ensure --check      # report only
 grok-bot-ensure --dry-run    # show what it would do
-grok-bot-ensure --force      # skip debounce/game/cap guards
-touch ~/.local/state/grok-bot-watchdog/PAUSE   # pause the watchdog
+grok-bot-ensure --force      # skip debounce/backoff/cap (guards still apply)
+touch ~/.config/grok-bot-watchdog/PAUSE   # pause (any file in GBW_PAUSE_FILES)
 ```
 
-Optional config: `~/.config/grok-bot-watchdog/config` (see
-`linux/config.example`). If another tool already relaunches the app when it
-is closed, set `GBW_RELAUNCH_IF_MAIN_DOWN=0`, and point `GBW_LAUNCH_CMD` at
-your compositor's launcher if you want the app to start in its usual place.
+Configuration: `~/.config/grok-bot-watchdog/config` (installed from
+`linux/config.example`; every setting is documented there).
 
 ## Install
 
 ```sh
-git clone https://github.com/OWNER/grok-bot-watchdog && cd grok-bot-watchdog
-./linux/install.sh            # copies to ~/.local/bin, enables the timer
+git clone https://github.com/jordanpartridge/grok-bot-watchdog && cd grok-bot-watchdog
+./linux/install.sh
 systemctl --user list-timers grok-bot-watchdog.timer
 journalctl --user -u grok-bot-watchdog.service -n 20
 ```
 
-macOS (**untested**): `./macos/install.sh` installs a LaunchAgent that runs
-`grok-bot-ensure-macos` every 300 s (uses `pgrep`, `osascript` quit and
-`open -a`).
+The service runs with `NoNewPrivileges`, `ProtectSystem=strict` (write
+access only to its state dir), `ProtectKernelTunables` and
+`RestrictSUIDSGID`. Previous script versions are kept under
+`~/.local/state/grok-bot-watchdog/previous/`, not next to your files.
+
+macOS (**untested**): `./macos/install.sh` installs a LaunchAgent running
+`grok-bot-ensure-macos` every 300 s (pgrep/lsof detection, `open -g -a`,
+same guards, cap and backoff; logs in `~/Library/Logs/grok-bot-watchdog`).
+On macOS it only relaunches an app that is not running (opt-in), since a
+daemon-only restart has not been validated there.
 
 ## Uninstall
 
 ```sh
-./linux/install.sh --uninstall
-./macos/install.sh --uninstall   # macOS
+./linux/install.sh --uninstall   # keep config and state
+./linux/install.sh --purge       # also delete config and state
+./macos/install.sh --uninstall | --purge
 ```
 
 ## Limitations
 
 - Daemon detection is a heuristic based on process layout; an app update
-  can change it. The daemon could also be alive but wedged (not detected).
+  can change it. A daemon that is alive but wedged is not detected.
+- An idle daemon with no marker is only declared down if the app loses a
+  NodeService child compared with the last positive identification.
 - The daemon lives inside the app, so recovery restarts the whole app.
-- The game guard is pattern-based (`GBW_GAME_PROCS`, `GBW_GAME_MATCH`); it errs on the side
-  of not restarting.
-- Only the user's own session; multi-seat setups are not handled.
-- The macOS version has not been tested on real hardware.
+- Game/stream guards are pattern-based and err on the side of not acting.
+- Single-user, single-session only. The macOS version is untested.
 
 ## License
 

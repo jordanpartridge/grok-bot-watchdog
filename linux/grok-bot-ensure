@@ -2,23 +2,26 @@
 # grok-bot-ensure - keep the Grok Bot desktop app's local-exec daemon alive.
 # Community-made; not affiliated with or endorsed by the app's vendor.
 #
-# Usage: grok-bot-ensure [--dry-run] [--check] [--force] [--verbose] [--help]
+# Usage: grok-bot-ensure [--check] [--dry-run] [--force] [--verbose] [--help]
 #
-# Exit codes:
-#   0  healthy, nothing to do
+#   --check    report only; exit 0 healthy, 1 not healthy
+#   --dry-run  show what would be done; never signals or launches anything
+#   --force    skip debounce / backoff / cap (never skips the game/stream guard)
+#
+# Exit codes (normal mode):
+#   0  healthy (or idle with no evidence of a drop) - nothing done
 #   10 was unhealthy, recovered by relaunch
-#   11 unhealthy but deferred (debounce, game running, paused, backoff cap)
+#   11 unhealthy but deferred (paused, debounce, game/stream, backoff, cap,
+#      clean app exit, app-down handling disabled)
 #   12 dry-run: would have acted
-#   2  usage error
-#   3  no graphical session found for this user
-#   4  app binary not found
-#   5  relaunch attempted but daemon still not healthy
-#   6  another instance is running (lock held)
+#   2  usage / config error      3  no graphical session found
+#   4  app binary not found      5  relaunch attempted, still unhealthy
+#   6  another instance running  7  host does not match GBW_HOST_REGEX
 #
-# Safe over SSH (discovers session env itself), idempotent, never needs root.
+# Safe over SSH (discovers the session env itself), idempotent, never needs root.
 set -uo pipefail
 
-VERSION=0.1.0
+VERSION=0.2.0
 DRY=0 CHECK=0 FORCE=0 VERBOSE=0
 for a in "$@"; do
   case "$a" in
@@ -27,50 +30,68 @@ for a in "$@"; do
     --force)      FORCE=1 ;;
     --verbose|-v) VERBOSE=1 ;;
     --version)    echo "$VERSION"; exit 0 ;;
-    -h|--help)    sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)    sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown arg: $a" >&2; exit 2 ;;
   esac
 done
 
-# ---- configuration (env or ~/.config/grok-bot-watchdog/config) -------------
-CONF="${GBW_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/grok-bot-watchdog/config}"
-# shellcheck disable=SC1090
-[[ -r "$CONF" ]] && . "$CONF"
-
-: "${GBW_APP_BIN:=}"                      # auto-detected if empty
-: "${GBW_DAEMON_MATCH:=local-exec-daemon}"  # cmdline pattern of a standalone daemon (older builds)
-: "${GBW_LAUNCH_CMD:=}"                   # custom launch command (string, run via sh -c)
-: "${GBW_DEBOUNCE:=2}"                    # consecutive unhealthy checks before acting
-: "${GBW_CAP:=3}"                         # max relaunches per window
-: "${GBW_CAP_WINDOW:=3600}"               # seconds
-: "${GBW_TERM_WAIT:=10}"                  # seconds between SIGTERM and SIGKILL
-: "${GBW_SETTLE:=20}"                     # seconds to wait for daemon after launch
-: "${GBW_GAME_GUARD:=1}"                  # skip relaunch while a game runs
-: "${GBW_GAME_PROCS:=gamescope|vrserver|vrcompositor}"   # exact process names
-: "${GBW_GAME_MATCH:=^[^ ]*/reaper SteamLaunch }"         # cmdline regex (anchored)
-: "${GBW_RELAUNCH_IF_MAIN_DOWN:=1}"       # 0 = leave app-down to another launcher
-
+# ---- configuration ----------------------------------------------------------
+CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/grok-bot-watchdog"
+CONF="${GBW_CONFIG:-$CONF_DIR/config}"
 STATE="${XDG_STATE_HOME:-$HOME/.local/state}/grok-bot-watchdog"
+# shellcheck disable=SC1090
+if [[ -r "$CONF" ]]; then . "$CONF" || { echo "bad config: $CONF" >&2; exit 2; }; fi
+
+: "${GBW_HOST_REGEX:=}"                   # refuse to run unless hostname matches
+: "${GBW_PAUSE_FILES:=$CONF_DIR/PAUSE:$STATE/PAUSE}"   # colon separated
+: "${GBW_APP_BIN:=}"                      # auto-detected if empty
+: "${GBW_APP_DATA:=${XDG_CONFIG_HOME:-$HOME/.config}/Grok Bot}"  # Electron user-data dir
+: "${GBW_DAEMON_MATCH:=}"                 # regex for a standalone daemon cmdline (older builds)
+: "${GBW_DAEMON_FD_MARKER:=/terminals/[0-9]+\.txt$}"  # regex for files the daemon holds open
+: "${GBW_LAUNCH_CMD:=}"                   # custom launch command (run via sh -c)
+: "${GBW_RELAUNCH_IF_MAIN_DOWN:=0}"       # 1 = also start the app when it is not running
+: "${GBW_DEBOUNCE:=2}"                    # consecutive unhealthy checks before acting
+: "${GBW_BACKOFF_BASE:=300}"              # seconds; doubles with each recent relaunch
+: "${GBW_CAP:=3}"                         # max relaunches per window
+: "${GBW_CAP_WINDOW:=3600}"
+: "${GBW_TERM_WAIT:=10}"
+: "${GBW_SETTLE:=30}"
+: "${GBW_GAME_GUARD:=1}"
+: "${GBW_GAME_PROCS:=gamescope|vrserver|vrcompositor}"   # exact process names
+: "${GBW_GAME_MATCH:=^[^ ]*/reaper SteamLaunch }"         # cmdline regex
+: "${GBW_STREAM_GUARD:=1}"
+: "${GBW_SUNSHINE_LOG:=${XDG_CONFIG_HOME:-$HOME/.config}/sunshine/sunshine.log}"
+: "${GBW_STREAM_PORTS:=47998|47999|48000|48002|48010}"   # Sunshine/GameStream UDP/TCP
+: "${GBW_NOTIFY:=1}"
+
+UID_="$(id -u)"
 mkdir -p "$STATE"
 LOG="$STATE/ensure.log"
-UID_="$(id -u)"
+ts()  { date '+%Y-%m-%dT%H:%M:%S%z'; }
+log() { printf '%s %s\n' "$(ts)" "$*" >>"$LOG"; printf '%s\n' "$*"; }
+dbg() { (( VERBOSE )) && printf 'debug: %s\n' "$*" >&2; return 0; }
+re_escape() { printf '%s' "$1" | sed 's/[][\.^$*+?(){}|/]/\\&/g'; }
+notify() {
+  (( GBW_NOTIFY )) || return 0
+  command -v notify-send >/dev/null 2>&1 && notify-send -a grok-bot-watchdog "Grok Bot watchdog" "$1" >/dev/null 2>&1
+  return 0
+}
 
-ts()   { date '+%Y-%m-%dT%H:%M:%S%z'; }
-log()  { printf '%s %s\n' "$(ts)" "$*" >>"$LOG"; printf '%s\n' "$*"; }
-dbg()  { (( VERBOSE )) && printf 'debug: %s\n' "$*" >&2; return 0; }
-
-# ---- single instance ----------------------------------------------------------
-exec 9>"$STATE/lock"
-if ! flock -n 9; then echo "status=locked"; exit 6; fi
-
-# ---- pause switch -------------------------------------------------------------
-if [[ -e "$STATE/PAUSE" && $FORCE -eq 0 ]]; then
-  echo "status=paused ($STATE/PAUSE exists)"; exit 11
+# ---- host / lock / pause ----------------------------------------------------
+if [[ -n "$GBW_HOST_REGEX" ]]; then
+  host="$(hostname -s 2>/dev/null || hostname)"
+  [[ "$host" =~ $GBW_HOST_REGEX ]] || { echo "refuse: host does not match GBW_HOST_REGEX" >&2; exit 7; }
 fi
+exec 9>"$STATE/lock"
+flock -n 9 || { echo "status=locked"; exit 6; }
+IFS=: read -r -a _pauses <<<"$GBW_PAUSE_FILES"
+for p in "${_pauses[@]}"; do
+  [[ -n "$p" && -e "$p" ]] && { echo "status=paused file=$p"; (( CHECK )) && exit 0; exit 11; }
+done
 
-# ---- locate the app -------------------------------------------------------------
+# ---- locate the app ---------------------------------------------------------
 find_app() {
-  [[ -n "$GBW_APP_BIN" && -x "$GBW_APP_BIN" ]] && { echo "$GBW_APP_BIN"; return; }
+  [[ -n "$GBW_APP_BIN" ]] && { [[ -x "$GBW_APP_BIN" ]] && readlink -f "$GBW_APP_BIN"; return; }
   local c
   for c in "/opt/Grok Bot/grok-bot" /opt/grok-bot/grok-bot /usr/lib/grok-bot/grok-bot \
            "$HOME/.local/opt/Grok Bot/grok-bot" "$(command -v grok-bot 2>/dev/null)"; do
@@ -78,45 +99,90 @@ find_app() {
   done
   return 1
 }
-APP="$(find_app)" || { echo "status=no_app (set GBW_APP_BIN)" >&2; exit 4; }
+APP="$(find_app)"
+[[ -n "$APP" ]] || { echo "status=no_app (set GBW_APP_BIN)" >&2; exit 4; }
+COMM="$(basename "$APP" | cut -c1-15)"
 dbg "app=$APP"
 
-# Main process: our uid, exe under the app dir, no Chromium --type= flag.
+# All processes of THIS user whose executable is exactly $APP (not cmdline text,
+# so an editor or pager showing the string never counts).
+app_pids() {
+  local p
+  for p in $(pgrep -u "$UID_" -x -- "$(re_escape "$COMM")" 2>/dev/null); do
+    [[ "$(readlink "/proc/$p/exe" 2>/dev/null)" == "$APP" ]] && echo "$p"
+  done
+}
+cmdline() { tr '\0' ' ' <"/proc/$1/cmdline" 2>/dev/null; }
 main_pids() {
-  local p cmd
-  for p in $(pgrep -u "$UID_" -f "^$APP( |\$)" 2>/dev/null); do
-    cmd="$(tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null)" || continue
-    [[ -z "$cmd" || "$cmd" == *" --type="* ]] && continue
-    echo "$p"
+  local p c
+  for p in $(app_pids); do
+    c="$(cmdline "$p")"; [[ -n "$c" && "$c" != *" --type="* ]] && echo "$p"
   done
 }
-
-# Daemon: either a standalone process matching GBW_DAEMON_MATCH, or (current
-# builds) a node.mojom.NodeService utility child of the main process.
-daemon_pids() {
-  local m="$1" p
-  pgrep -u "$UID_" -f "$GBW_DAEMON_MATCH" 2>/dev/null
-  [[ -z "$m" ]] && return 0
-  for p in $(pgrep -u "$UID_" -P "$m" 2>/dev/null); do
-    tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null | grep -q -- '--utility-sub-type=node.mojom.NodeService' && echo "$p"
+nodeservice_children() {
+  local p
+  for p in $(pgrep -u "$UID_" -P "$1" 2>/dev/null); do
+    [[ "$(readlink "/proc/$p/exe" 2>/dev/null)" == "$APP" ]] || continue
+    [[ "$(cmdline "$p")" == *"--utility-sub-type=node.mojom.NodeService"* ]] && echo "$p"
   done
 }
+# Daemon = the NodeService child carrying a local-exec marker: it has child
+# processes (shells it runs), or holds a terminal-output file open, or a
+# standalone process matches GBW_DAEMON_MATCH (user-scoped, anchored).
+daemon_marker() {
+  local p="$1" f
+  [[ -n "$(pgrep -u "$UID_" -P "$p" 2>/dev/null)" ]] && { echo children; return 0; }
+  for f in /proc/"$p"/fd/*; do
+    f="$(readlink "$f" 2>/dev/null)" || continue
+    [[ "$f" =~ $GBW_DAEMON_FD_MARKER ]] && { echo fd; return 0; }
+  done
+  return 1
+}
+standalone_daemon() {
+  [[ -n "$GBW_DAEMON_MATCH" ]] && pgrep -u "$UID_" -f -- "^[^ ]*($GBW_DAEMON_MATCH)" 2>/dev/null | head -1
+  return 0
+}
 
-# ---- session discovery (works from SSH / systemd with an empty env) ------------
+# ---- guards -------------------------------------------------------------------
+game_running() {
+  (( GBW_GAME_GUARD )) || return 1
+  pgrep -u "$UID_" -x -- "$GBW_GAME_PROCS" >/dev/null 2>&1 ||
+    pgrep -u "$UID_" -f -- "$GBW_GAME_MATCH" >/dev/null 2>&1
+}
+# An active Sunshine stream: the last connect/disconnect line in its log is a
+# connect, or a stream port has an established/connected peer with queued data.
+stream_active() {
+  (( GBW_STREAM_GUARD )) || return 1
+  local last
+  if [[ -r "$GBW_SUNSHINE_LOG" ]]; then
+    last="$(grep -a -E 'CLIENT (DIS)?CONNECTED' "$GBW_SUNSHINE_LOG" 2>/dev/null | tail -1)"
+    [[ "$last" == *"CLIENT CONNECTED"* ]] && return 0
+  fi
+  command -v ss >/dev/null 2>&1 || return 1
+  ss -Htun state established 2>/dev/null |
+    awk -v re=":($GBW_STREAM_PORTS)\$" '$4 ~ re || $3 ~ re {found=1} END{exit !found}' && return 0
+  ss -Hun 2>/dev/null |
+    awk -v re=":($GBW_STREAM_PORTS)\$" '($4 ~ re) && $5 !~ /\*$/ {found=1} END{exit !found}'
+}
+# Returns 0 (and prints why) if a relaunch must not happen right now.
+guard_blocks() {
+  if game_running;  then echo game_running;  return 0; fi
+  if stream_active; then echo stream_active; return 0; fi
+  return 1
+}
+
+# ---- session discovery (works from SSH / systemd with an empty env) ----------
+SESSION=none
 discover_session() {
   export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$UID_}"
-  local rt="$XDG_RUNTIME_DIR" s sid type desk
+  local rt="$XDG_RUNTIME_DIR" s sid type desk donor="" d kv k
   [[ -d "$rt" ]] || return 1
-
-  # 1) borrow env from a live process already in the graphical session
-  local donor="" d
-  for d in "$(main_pids 2>/dev/null | head -1)" \
-           $(pgrep -u "$UID_" -x 'Hyprland|gnome-shell|kwin_wayland|kwin_x11|plasmashell|sway|xfce4-session|mutter' 2>/dev/null); do
-    [[ -n "$d" && -r "/proc/$d/environ" ]] && { donor="$d"; break; }
+  for d in $(main_pids 2>/dev/null | head -1) \
+           $(pgrep -u "$UID_" -x 'Hyprland|gnome-shell|kwin_wayland|kwin_x11|plasmashell|sway|xfce4-session' 2>/dev/null); do
+    [[ -r "/proc/$d/environ" ]] && { donor="$d"; break; }
   done
   if [[ -n "$donor" ]]; then
     dbg "env donor pid=$donor"
-    local kv k
     while IFS= read -r -d '' kv; do
       k="${kv%%=*}"
       case "$k" in
@@ -125,26 +191,18 @@ discover_session() {
       esac
     done <"/proc/$donor/environ"
   fi
-
-  # 2) fill gaps from sockets
   if [[ -z "${HYPRLAND_INSTANCE_SIGNATURE:-}" && -d "$rt/hypr" ]]; then
     # shellcheck disable=SC2012  # newest socket wins; names are hex
     s="$(ls -t "$rt"/hypr/*/.socket.sock 2>/dev/null | head -1)"
     [[ -n "$s" ]] && { s="${s%/.socket.sock}"; export HYPRLAND_INSTANCE_SIGNATURE="${s##*/}"; }
   fi
   if [[ -z "${WAYLAND_DISPLAY:-}" ]]; then
-    for s in "$rt"/wayland-[0-9]*; do
-      [[ -S "$s" ]] && { export WAYLAND_DISPLAY="${s##*/}"; break; }
-    done
+    for s in "$rt"/wayland-[0-9]*; do [[ -S "$s" ]] && { export WAYLAND_DISPLAY="${s##*/}"; break; }; done
   fi
   if [[ -z "${DISPLAY:-}" ]]; then
-    for s in /tmp/.X11-unix/X*; do
-      [[ -S "$s" ]] && { s="${s##*/}"; export DISPLAY=":${s#X}"; break; }
-    done
+    for s in /tmp/.X11-unix/X*; do [[ -S "$s" ]] && { s="${s##*/}"; export DISPLAY=":${s#X}"; break; }; done
   fi
   [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" && -S "$rt/bus" ]] && export DBUS_SESSION_BUS_ADDRESS="unix:path=$rt/bus"
-
-  # 3) loginctl for session type/desktop
   if [[ -z "${XDG_SESSION_TYPE:-}" ]] && command -v loginctl >/dev/null 2>&1; then
     for sid in $(loginctl list-sessions --no-legend 2>/dev/null | awk -v u="$(id -un)" '$3==u{print $1}'); do
       type="$(loginctl show-session "$sid" -p Type --value 2>/dev/null)"
@@ -158,27 +216,18 @@ discover_session() {
   fi
   [[ -z "${XDG_SESSION_TYPE:-}" && -n "${WAYLAND_DISPLAY:-}" ]] && export XDG_SESSION_TYPE=wayland
   [[ -z "${XDG_SESSION_TYPE:-}" && -n "${DISPLAY:-}" ]] && export XDG_SESSION_TYPE=x11
-
-  if   [[ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]]; then SESSION=hyprland
-  elif [[ "${XDG_CURRENT_DESKTOP:-}" == *GNOME* ]]; then SESSION=gnome
-  elif [[ "${XDG_CURRENT_DESKTOP:-}" == *KDE* ]];   then SESSION=kde
-  elif [[ -n "${SWAYSOCK:-}" ]];                    then SESSION=sway
+  if   [[ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]];   then SESSION=hyprland
+  elif [[ "${XDG_CURRENT_DESKTOP:-}" == *GNOME* ]];   then SESSION=gnome
+  elif [[ "${XDG_CURRENT_DESKTOP:-}" == *KDE* ]];     then SESSION=kde
+  elif [[ -n "${SWAYSOCK:-}" ]];                      then SESSION=sway
   else SESSION="${XDG_SESSION_TYPE:-none}"; fi
-
   [[ -n "${WAYLAND_DISPLAY:-}" || -n "${DISPLAY:-}" ]]
 }
 
-game_running() {
-  (( GBW_GAME_GUARD )) || return 1
-  pgrep -u "$UID_" -x -- "$GBW_GAME_PROCS" >/dev/null 2>&1 ||
-    pgrep -u "$UID_" -f -- "$GBW_GAME_MATCH" >/dev/null 2>&1
-}
-
+SESSION_VARS=(WAYLAND_DISPLAY DISPLAY XAUTHORITY HYPRLAND_INSTANCE_SIGNATURE XDG_SESSION_TYPE XDG_CURRENT_DESKTOP DBUS_SESSION_BUS_ADDRESS)
 push_env_to_manager() {
-  # Make the session env visible to systemd/dbus-activated children as well.
-  local vars=(WAYLAND_DISPLAY DISPLAY XAUTHORITY HYPRLAND_INSTANCE_SIGNATURE XDG_SESSION_TYPE XDG_CURRENT_DESKTOP)
   local set=() v
-  for v in "${vars[@]}"; do [[ -n "${!v:-}" ]] && set+=("$v"); done
+  for v in "${SESSION_VARS[@]}"; do [[ -n "${!v:-}" ]] && set+=("$v"); done
   ((${#set[@]})) || return 0
   systemctl --user import-environment "${set[@]}" >/dev/null 2>&1 || true
   if command -v dbus-update-activation-environment >/dev/null 2>&1; then
@@ -187,26 +236,29 @@ push_env_to_manager() {
 }
 
 launch_app() {
-  local flags=()
   if [[ -n "$GBW_LAUNCH_CMD" ]]; then
-    setsid sh -c "$GBW_LAUNCH_CMD" >>"$STATE/app.log" 2>&1 </dev/null &
-  else
-    if [[ "${XDG_SESSION_TYPE:-}" == wayland ]]; then
-      # shellcheck disable=SC2054  # commas are part of the flag value
-      flags=(--ozone-platform=wayland --enable-features=UseOzonePlatform,WaylandWindowDecorations --enable-wayland-ime)
-    fi
-    if command -v systemd-run >/dev/null 2>&1; then
-      # own scope, so stopping our service never takes the app down
-      systemd-run --user --scope --quiet --collect -- "$APP" "${flags[@]}" >>"$STATE/app.log" 2>&1 </dev/null &
-    else
-      setsid "$APP" "${flags[@]}" >>"$STATE/app.log" 2>&1 </dev/null &
-    fi
+    sh -c "$GBW_LAUNCH_CMD" >>"$STATE/app.log" 2>&1 </dev/null
+    return
   fi
-  disown 2>/dev/null || true
+  local flags=() envs=() v
+  if [[ "${XDG_SESSION_TYPE:-}" == wayland ]]; then
+    # shellcheck disable=SC2054  # commas are part of the flag value
+    flags=(--ozone-platform=wayland --enable-features=UseOzonePlatform,WaylandWindowDecorations --enable-wayland-ime)
+  fi
+  if command -v systemd-run >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
+    # Started by the user manager as its own unit: outside this service's
+    # sandbox, and stopping the watchdog never takes the app down.
+    for v in "${SESSION_VARS[@]}"; do [[ -n "${!v:-}" ]] && envs+=("--setenv=$v=${!v}"); done
+    systemd-run --user --quiet --collect --unit="grok-bot-app-$(date +%s)" \
+      -p KillMode=process "${envs[@]}" -- "$APP" "${flags[@]}" >>"$STATE/app.log" 2>&1
+  else
+    setsid "$APP" "${flags[@]}" >>"$STATE/app.log" 2>&1 </dev/null &
+    disown 2>/dev/null || true
+  fi
 }
 
-stop_app() {
-  local pids p i
+stop_app_graceful() {
+  local i pids
   mapfile -t pids < <(main_pids)
   ((${#pids[@]})) || return 0
   kill -TERM "${pids[@]}" 2>/dev/null || true
@@ -214,96 +266,144 @@ stop_app() {
     [[ -z "$(main_pids)" ]] && return 0
     sleep 1
   done
-  log "stop: SIGTERM timed out; SIGKILL"
-  for p in $(pgrep -u "$UID_" -f "^$APP( |\$)" 2>/dev/null); do kill -KILL "$p" 2>/dev/null || true; done
-  sleep 1
+  return 1
 }
 
+# Healthy = main up and a NodeService child with a local-exec marker (or a
+# matching standalone daemon). Sets MAIN, DAEMON, HOW, NS_COUNT.
+probe() {
+  MAIN="$(main_pids 2>/dev/null | head -1)"; DAEMON="" HOW="" NS_COUNT=0
+  local c m s
+  s="$(standalone_daemon)"
+  [[ -n "$s" ]] && { DAEMON="$s"; HOW=standalone; }
+  [[ -z "$MAIN" ]] && { [[ -n "$DAEMON" ]]; return; }
+  for c in $(nodeservice_children "$MAIN"); do
+    NS_COUNT=$((NS_COUNT + 1))
+    if [[ -z "$DAEMON" ]] && m="$(daemon_marker "$c")"; then DAEMON="$c"; HOW="$m"; fi
+  done
+  [[ -n "$DAEMON" ]]
+}
 wait_healthy() {
-  local i m
+  local i
   for ((i = 0; i < GBW_SETTLE; i++)); do
-    m="$(main_pids 2>/dev/null | head -1)"
-    [[ -n "$m" && -n "$(daemon_pids "$m")" ]] && return 0
+    probe && return 0
     sleep 1
   done
   return 1
 }
 
-# ---- health check -----------------------------------------------------------------
-MAIN="$(main_pids 2>/dev/null | head -1)"
-DAEMON="$(daemon_pids "$MAIN" 2>/dev/null | head -1)"
-FAILS_F="$STATE/fails"
-
-if [[ -n "$MAIN" && -n "$DAEMON" ]]; then
-  echo 0 >"$FAILS_F"
-  dbg "main=$MAIN daemon=$DAEMON"
-  echo "status=ok main=$MAIN daemon=$DAEMON"
+# ---- health check -------------------------------------------------------------
+FAILS_F="$STATE/fails" BASE_F="$STATE/nodeservice-baseline"
+if probe; then
+  echo 0 >"$FAILS_F"; echo "$NS_COUNT" >"$BASE_F"; rm -f "$STATE/cap-notified"
+  echo "status=ok main=$MAIN daemon=$DAEMON via=$HOW"
   exit 0
 fi
 
-if [[ -z "$MAIN" ]]; then reason=app_down; else reason=daemon_down; fi
-(( CHECK )) && { echo "status=unhealthy reason=$reason"; exit 11; }
+if [[ -z "$MAIN" ]]; then
+  reason=app_down
+else
+  # No marker right now. The daemon can be idle (no shells, no open files),
+  # so only call it down if the app lost a NodeService child since the last
+  # time the daemon was positively identified.
+  base="$(cat "$BASE_F" 2>/dev/null || echo 0)"
+  if (( base == 0 || NS_COUNT >= base )); then
+    echo 0 >"$FAILS_F"
+    echo "status=ok_idle main=$MAIN nodeservice=$NS_COUNT baseline=$base (no marker; no evidence of a drop)"
+    exit 0
+  fi
+  reason=daemon_down
+fi
+(( CHECK )) && { echo "status=unhealthy reason=$reason"; exit 1; }
+
+if [[ "$reason" == app_down ]]; then
+  if [[ "$GBW_RELAUNCH_IF_MAIN_DOWN" != 1 ]]; then
+    echo "status=deferred reason=app_down (GBW_RELAUNCH_IF_MAIN_DOWN=0)"; exit 11
+  fi
+  # Electron removes SingletonLock on a clean quit; a leftover lock means a crash/kill.
+  if [[ ! -L "$GBW_APP_DATA/SingletonLock" ]]; then
+    echo "status=deferred reason=clean_exit (app was quit intentionally)"; exit 11
+  fi
+fi
 
 fails=$(( $(cat "$FAILS_F" 2>/dev/null || echo 0) + 1 ))
 (( DRY )) || echo "$fails" >"$FAILS_F"
-
-if [[ "$reason" == app_down && "$GBW_RELAUNCH_IF_MAIN_DOWN" != 1 ]]; then
-  echo "status=deferred reason=app_down (GBW_RELAUNCH_IF_MAIN_DOWN=0)"; exit 11
-fi
 if (( fails < GBW_DEBOUNCE && FORCE == 0 && DRY == 0 )); then
   log "unhealthy reason=$reason check=$fails/$GBW_DEBOUNCE - waiting for next run"
   echo "status=deferred reason=debounce"; exit 11
 fi
-if [[ "$reason" == daemon_down ]] && game_running && (( FORCE == 0 )); then
-  log "unhealthy reason=$reason but a game is running - not restarting the app"
-  echo "status=deferred reason=game_running"; exit 11
+if why="$(guard_blocks)"; then
+  log "unhealthy reason=$reason but $why - not relaunching"
+  echo "status=deferred reason=$why"; exit 11
 fi
 
-# relaunch cap
-now=$(date +%s)
-recent=0
+# relaunch cap + exponential backoff
+now=$(date +%s) recent=0 last=0
 if [[ -f "$STATE/relaunches" ]]; then
-  while read -r t; do (( now - t < GBW_CAP_WINDOW )) && recent=$((recent + 1)); done <"$STATE/relaunches"
+  while read -r t; do
+    [[ "$t" =~ ^[0-9]+$ ]] || continue
+    (( now - t < GBW_CAP_WINDOW )) && recent=$((recent + 1))
+    (( t > last )) && last=$t
+  done <"$STATE/relaunches"
 fi
-if (( recent >= GBW_CAP && FORCE == 0 )); then
-  log "cap reached ($recent relaunches in ${GBW_CAP_WINDOW}s) - backing off"
-  echo "status=deferred reason=cap"; exit 11
+if (( FORCE == 0 )); then
+  if (( recent >= GBW_CAP )); then
+    log "cap reached ($recent relaunches in ${GBW_CAP_WINDOW}s) - backing off"
+    if [[ ! -e "$STATE/cap-notified" ]] && (( ! DRY )); then
+      discover_session >/dev/null 2>&1 || true
+      notify "Local-exec daemon keeps dropping; relaunch cap ($GBW_CAP/${GBW_CAP_WINDOW}s) hit. Watchdog is backing off."
+      touch "$STATE/cap-notified"
+    fi
+    echo "status=deferred reason=cap"; exit 11
+  fi
+  if (( recent > 0 )); then
+    wait_s=$(( GBW_BACKOFF_BASE * (1 << (recent - 1)) ))
+    if (( now - last < wait_s )); then
+      echo "status=deferred reason=backoff next_in=$(( wait_s - (now - last) ))s"; exit 11
+    fi
+  fi
 fi
 
-if ! discover_session; then
-  log "no graphical session found for uid $UID_"
-  echo "status=no_session" >&2; exit 3
-fi
+discover_session || { log "no graphical session found for uid $UID_"; echo "status=no_session" >&2; exit 3; }
 dbg "session=$SESSION type=${XDG_SESSION_TYPE:-} wayland=${WAYLAND_DISPLAY:-} display=${DISPLAY:-}"
 
 if (( DRY )); then
   echo "dry-run: reason=$reason session=$SESSION"
-  [[ "$reason" == daemon_down ]] && echo "dry-run: would SIGTERM app pid $MAIN (SIGKILL after ${GBW_TERM_WAIT}s)"
-  echo "dry-run: would import session env into systemd --user and relaunch: ${GBW_LAUNCH_CMD:-$APP}"
+  [[ "$reason" == daemon_down ]] && echo "dry-run: would SIGTERM app pid $MAIN, then SIGKILL its tree if needed"
+  echo "dry-run: would import session env and relaunch: ${GBW_LAUNCH_CMD:-$APP}"
   exit 12
 fi
 
 echo "$now" >>"$STATE/relaunches"
 tail -n 20 "$STATE/relaunches" >"$STATE/relaunches.tmp" && mv "$STATE/relaunches.tmp" "$STATE/relaunches"
-
 push_env_to_manager
 log "recover: reason=$reason session=$SESSION"
 
-# Tier 1: (app down) just launch with a fixed env.  (daemon down) graceful stop + launch.
-[[ "$reason" == daemon_down ]] && stop_app
-launch_app
+# Tier 1: graceful stop (if running) + relaunch with a fixed env.
+if [[ "$reason" == daemon_down ]]; then
+  if why="$(guard_blocks)"; then log "abort before stop: $why"; echo "status=deferred reason=$why"; exit 11; fi
+  stop_app_graceful || log "graceful stop timed out"
+fi
+if [[ -z "$(main_pids)" ]]; then
+  if why="$(guard_blocks)"; then log "abort before launch: $why"; echo "status=deferred reason=$why"; exit 11; fi
+  launch_app
+fi
 if wait_healthy; then
   echo 0 >"$FAILS_F"; log "recovered (tier1)"; echo "status=recovered reason=$reason"; exit 10
 fi
 
-# Tier 2: hard relaunch.
+# Tier 2: hard relaunch. Re-check the guards right before the kill.
+if why="$(guard_blocks)"; then log "abort before hard kill: $why"; echo "status=deferred reason=$why"; exit 11; fi
 log "tier1 failed; hard relaunch"
-for p in $(pgrep -u "$UID_" -f "^$APP( |\$)" 2>/dev/null); do kill -KILL "$p" 2>/dev/null || true; done
+mapfile -t all < <(app_pids)
+((${#all[@]})) && kill -KILL "${all[@]}" 2>/dev/null
 sleep 2
+if why="$(guard_blocks)"; then log "abort before launch: $why"; echo "status=deferred reason=$why"; exit 11; fi
 launch_app
 if wait_healthy; then
   echo 0 >"$FAILS_F"; log "recovered (tier2 hard)"; echo "status=recovered reason=$reason tier=hard"; exit 10
 fi
 log "FAILED: daemon not healthy after hard relaunch"
+notify "Could not bring the local-exec daemon back (see $LOG)."
 echo "status=failed reason=$reason" >&2
 exit 5

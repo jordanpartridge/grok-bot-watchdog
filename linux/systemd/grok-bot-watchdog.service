@@ -1,14 +1,21 @@
 [Unit]
 Description=Grok Bot local-exec watchdog (community, unofficial)
-Documentation=https://github.com/OWNER/grok-bot-watchdog
+Documentation=https://github.com/jordanpartridge/grok-bot-watchdog
 After=graphical-session.target
 
 [Service]
 Type=oneshot
 ExecStart=%h/.local/bin/grok-bot-ensure
-# 10 = recovered, 11 = deferred (debounce / game running / paused / cap)
+# 10 = recovered, 11 = deferred (paused / debounce / game or stream / backoff / cap)
 SuccessExitStatus=10 11
-# Only the check runs in this unit; the app is launched in its own scope.
-KillMode=process
-TimeoutStartSec=120
+TimeoutStartSec=180
 Nice=10
+# Hardening. The app is never a child of this unit: it is started by the user
+# manager (systemd-run --user) or the compositor, so it does not inherit this
+# sandbox. No PrivateTmp/ProtectHome: session discovery reads /tmp/.X11-unix
+# and the app's user-data dir.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=%S/grok-bot-watchdog
+ProtectKernelTunables=yes
+RestrictSUIDSGID=yes

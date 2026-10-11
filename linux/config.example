@@ -1,10 +1,21 @@
-# ~/.config/grok-bot-watchdog/config  (sourced by grok-bot-ensure; all optional)
+# ~/.config/grok-bot-watchdog/config - sourced by grok-bot-ensure (bash syntax).
+# Everything is optional; the values shown are the defaults.
+#GBW_HOST_REGEX=""                  # e.g. "^my-desktop$": refuse to run elsewhere
+#GBW_PAUSE_FILES="$HOME/.config/grok-bot-watchdog/PAUSE:$HOME/.local/state/grok-bot-watchdog/PAUSE"
 #GBW_APP_BIN="/opt/Grok Bot/grok-bot"
-#GBW_LAUNCH_CMD="hyprctl dispatch exec grok-bot"   # use your compositor's launcher
-#GBW_DEBOUNCE=2            # consecutive bad checks before acting
-#GBW_CAP=3                 # max relaunches per GBW_CAP_WINDOW seconds
+#GBW_APP_DATA="$HOME/.config/Grok Bot"
+#GBW_LAUNCH_CMD=""                  # e.g. your compositor's exec dispatcher
+#GBW_RELAUNCH_IF_MAIN_DOWN=0        # 1 = also start the app if it is not running at all
+#GBW_DAEMON_MATCH=""                # regex for a standalone daemon process (older builds)
+#GBW_DAEMON_FD_MARKER='/terminals/[0-9]+\.txt$'
+#GBW_DEBOUNCE=2
+#GBW_BACKOFF_BASE=300               # seconds, doubles per recent relaunch
+#GBW_CAP=3
 #GBW_CAP_WINDOW=3600
-#GBW_GAME_GUARD=1          # don't restart the app while a game is running
-#GBW_GAME_PROCS="gamescope|vrserver|vrcompositor"   # exact process names
-#GBW_GAME_MATCH="^[^ ]*/reaper SteamLaunch "         # cmdline regex
-#GBW_RELAUNCH_IF_MAIN_DOWN=1   # set 0 if something else already relaunches the app
+#GBW_GAME_GUARD=1
+#GBW_GAME_PROCS="gamescope|vrserver|vrcompositor"
+#GBW_GAME_MATCH="^[^ ]*/reaper SteamLaunch "
+#GBW_STREAM_GUARD=1
+#GBW_SUNSHINE_LOG="$HOME/.config/sunshine/sunshine.log"
+#GBW_STREAM_PORTS="47998|47999|48000|48002|48010"
+#GBW_NOTIFY=1

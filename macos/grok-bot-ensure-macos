@@ -1,54 +1,123 @@
 #!/usr/bin/env bash
 # grok-bot-ensure-macos - UNTESTED macOS port of the Linux watchdog.
 # Community-made; not affiliated with or endorsed by the app's vendor.
+#
+# Usage: grok-bot-ensure-macos [--check] [--dry-run] [--force]
 # Exit codes match the Linux script: 0 ok, 10 recovered, 11 deferred,
-# 12 dry-run, 2 usage, 4 app not found, 5 failed, 6 locked.
+# 12 dry-run, 2 usage, 4 app not found, 5 failed, 6 locked, 7 host mismatch;
+# --check: 0 healthy, 1 not healthy.
 set -uo pipefail
-DRY=0 FORCE=0
+DRY=0 FORCE=0 CHECK=0
 for a in "$@"; do
   case "$a" in
     --dry-run|-n) DRY=1 ;;
+    --check) CHECK=1 ;;
     --force) FORCE=1 ;;
-    -h|--help) sed -n '2,5p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown arg: $a" >&2; exit 2 ;;
   esac
 done
 
-APP_NAME="${GBW_APP_NAME:-Grok Bot}"
-APP_PATH="${GBW_APP_PATH:-/Applications/$APP_NAME.app}"
+CONF_DIR="$HOME/.config/grok-bot-watchdog"
 STATE="$HOME/Library/Application Support/grok-bot-watchdog"
-mkdir -p "$STATE"
-LOG="$STATE/ensure.log"
+LOGDIR="$HOME/Library/Logs/grok-bot-watchdog"
+# shellcheck disable=SC1091
+[[ -r "$CONF_DIR/config" ]] && . "$CONF_DIR/config"
+: "${GBW_HOST_REGEX:=}"
+: "${GBW_PAUSE_FILES:=$CONF_DIR/PAUSE:$STATE/PAUSE}"
+: "${GBW_APP_NAME:=Grok Bot}"
+: "${GBW_APP_PATH:=/Applications/$GBW_APP_NAME.app}"
+: "${GBW_RELAUNCH_IF_MAIN_DOWN:=0}"
+: "${GBW_DEBOUNCE:=2}" "${GBW_CAP:=3}" "${GBW_CAP_WINDOW:=3600}" "${GBW_BACKOFF_BASE:=300}"
+: "${GBW_GAME_GUARD:=1}" "${GBW_GAME_MATCH:=^[^ ]*/reaper SteamLaunch }"
+: "${GBW_STREAM_GUARD:=1}" "${GBW_SUNSHINE_LOG:=$HOME/.config/sunshine/sunshine.log}"
+: "${GBW_DAEMON_FD_MARKER:=/terminals/[0-9]+\.txt$}"
+mkdir -p "$STATE" "$LOGDIR"
+LOG="$LOGDIR/ensure.log"
 log() { printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$*" >>"$LOG"; echo "$*"; }
+notify() { osascript -e "display notification \"$1\" with title \"Grok Bot watchdog\"" >/dev/null 2>&1 || true; }
 
-# mkdir-based lock (no flock on stock macOS)
+if [[ -n "$GBW_HOST_REGEX" ]]; then
+  [[ "$(hostname -s)" =~ $GBW_HOST_REGEX ]] || { echo "refuse: host mismatch" >&2; exit 7; }
+fi
+
+# mkdir lock with owner PID + age check so a crashed run can't wedge it.
 LOCK="$STATE/lock.d"
-mkdir "$LOCK" 2>/dev/null || { echo "status=locked"; exit 6; }
-trap 'rmdir "$LOCK"' EXIT
+if ! mkdir "$LOCK" 2>/dev/null; then
+  owner="$(cat "$LOCK/pid" 2>/dev/null || echo)"
+  age=$(( $(date +%s) - $(stat -f %m "$LOCK" 2>/dev/null || date +%s) ))
+  if [[ -n "$owner" ]] && kill -0 "$owner" 2>/dev/null && (( age < 600 )); then
+    echo "status=locked"; exit 6
+  fi
+  rm -rf "$LOCK"; mkdir "$LOCK" || { echo "status=locked"; exit 6; }
+fi
+echo $$ >"$LOCK/pid"
+trap 'rm -rf "$LOCK"' EXIT
 
-[[ -e "$STATE/PAUSE" && $FORCE -eq 0 ]] && { echo "status=paused"; exit 11; }
-[[ -d "$APP_PATH" ]] || { echo "status=no_app ($APP_PATH)" >&2; exit 4; }
+IFS=: read -r -a _p <<<"$GBW_PAUSE_FILES"
+for p in "${_p[@]}"; do [[ -n "$p" && -e "$p" ]] && { echo "status=paused file=$p"; (( CHECK )) && exit 0; exit 11; }; done
+[[ -d "$GBW_APP_PATH" ]] || { echo "status=no_app ($GBW_APP_PATH)" >&2; exit 4; }
+BINDIR="$GBW_APP_PATH/Contents/MacOS"
+UID_="$(id -u)"
 
-main_pid()   { pgrep -f "^$APP_PATH/Contents/MacOS/" | while read -r p; do ps -o command= -p "$p" | grep -q -- '--type=' || { echo "$p"; break; }; done; }
-daemon_up()  { local m="$1"; pgrep -f 'local-exec-daemon' >/dev/null && return 0
-               [[ -n "$m" ]] && pgrep -P "$m" -f 'node.mojom.NodeService' >/dev/null; }
-game_running() { [[ "${GBW_GAME_GUARD:-1}" == 1 ]] && pgrep -if "${GBW_GAME_MATCH:-^[^ ]*/reaper SteamLaunch |vrserver|vrcompositor}" >/dev/null; }
+main_pid() {
+  local p c
+  for p in $(pgrep -U "$UID_" -x "$GBW_APP_NAME" 2>/dev/null); do
+    c="$(ps -o command= -p "$p")"
+    [[ "$c" == "$BINDIR/"* && "$c" != *" --type="* ]] && { echo "$p"; return; }
+  done
+}
+# Helpers live in "<App> Helper*.app"; the daemon is the NodeService helper
+# that has child processes or holds a terminal-output file open.
+daemon_pid() {
+  local m="$1" p
+  for p in $(pgrep -U "$UID_" -P "$m" 2>/dev/null); do
+    ps -o command= -p "$p" | grep -q -- '--utility-sub-type=node.mojom.NodeService' || continue
+    if [[ -n "$(pgrep -P "$p")" ]] || lsof -Fn -p "$p" 2>/dev/null | sed -n 's/^n//p' | grep -Eq "$GBW_DAEMON_FD_MARKER"; then
+      echo "$p"; return
+    fi
+  done
+}
+guard_blocks() {
+  if (( GBW_GAME_GUARD )) && pgrep -U "$UID_" -f "$GBW_GAME_MATCH" >/dev/null; then echo game_running; return 0; fi
+  if (( GBW_STREAM_GUARD )) && [[ -r "$GBW_SUNSHINE_LOG" ]] &&
+     grep -a -E 'CLIENT (DIS)?CONNECTED' "$GBW_SUNSHINE_LOG" | tail -1 | grep -q 'CLIENT CONNECTED'; then
+    echo stream_active; return 0
+  fi
+  return 1
+}
 
-M="$(main_pid)"
-if [[ -n "$M" ]] && daemon_up "$M"; then echo 0 >"$STATE/fails"; echo "status=ok main=$M"; exit 0; fi
-reason=$([[ -z "$M" ]] && echo app_down || echo daemon_down)
+M="$(main_pid)"; D=""
+[[ -n "$M" ]] && D="$(daemon_pid "$M")"
+if [[ -n "$D" ]]; then echo 0 >"$STATE/fails"; echo "status=ok main=$M daemon=$D"; exit 0; fi
+if [[ -n "$M" ]]; then echo "status=ok_idle main=$M (no daemon marker; not acting on macOS without evidence)"; exit 0; fi
+(( CHECK )) && { echo "status=unhealthy reason=app_down"; exit 1; }
+[[ "$GBW_RELAUNCH_IF_MAIN_DOWN" == 1 ]] || { echo "status=deferred reason=app_down"; exit 11; }
+
 fails=$(( $(cat "$STATE/fails" 2>/dev/null || echo 0) + 1 ))
 (( DRY )) || echo "$fails" >"$STATE/fails"
-(( fails < ${GBW_DEBOUNCE:-2} && FORCE == 0 && DRY == 0 )) && { log "unhealthy $reason ($fails)"; echo "status=deferred reason=debounce"; exit 11; }
-[[ $reason == daemon_down ]] && game_running && (( FORCE == 0 )) && { echo "status=deferred reason=game_running"; exit 11; }
-(( DRY )) && { echo "dry-run: reason=$reason; would quit and 'open -a \"$APP_NAME\"'"; exit 12; }
+(( fails < GBW_DEBOUNCE && FORCE == 0 && DRY == 0 )) && { log "app down ($fails)"; echo "status=deferred reason=debounce"; exit 11; }
+if why="$(guard_blocks)"; then echo "status=deferred reason=$why"; exit 11; fi
 
-log "recover: $reason"
-if [[ $reason == daemon_down ]]; then
-  osascript -e "tell application \"$APP_NAME\" to quit" >/dev/null 2>&1 || kill -TERM "$M" 2>/dev/null
-  for _ in 1 2 3 4 5 6 7 8 9 10; do [[ -z "$(main_pid)" ]] && break; sleep 1; done
-  [[ -n "$(main_pid)" ]] && pkill -KILL -f "^$APP_PATH/Contents/" 
+now=$(date +%s) recent=0 last=0
+[[ -f "$STATE/relaunches" ]] && while read -r t; do
+  (( now - t < GBW_CAP_WINDOW )) && recent=$((recent + 1)); (( t > last )) && last=$t
+done <"$STATE/relaunches"
+if (( FORCE == 0 )); then
+  if (( recent >= GBW_CAP )); then
+    [[ -e "$STATE/cap-notified" ]] || { notify "Relaunch cap hit; backing off."; touch "$STATE/cap-notified"; }
+    echo "status=deferred reason=cap"; exit 11
+  fi
+  (( recent > 0 && now - last < GBW_BACKOFF_BASE * (1 << (recent - 1)) )) && { echo "status=deferred reason=backoff"; exit 11; }
 fi
-open -g -a "$APP_PATH"
-for _ in $(seq 1 20); do M="$(main_pid)"; [[ -n "$M" ]] && daemon_up "$M" && { echo 0 >"$STATE/fails"; log recovered; echo status=recovered; exit 10; }; sleep 1; done
-log FAILED; echo status=failed >&2; exit 5
+(( DRY )) && { echo "dry-run: would 'open -g -a \"$GBW_APP_PATH\"'"; exit 12; }
+
+echo "$now" >>"$STATE/relaunches"
+if why="$(guard_blocks)"; then echo "status=deferred reason=$why"; exit 11; fi
+log "recover: app_down"
+open -g -a "$GBW_APP_PATH"
+for _ in $(seq 1 30); do
+  M="$(main_pid)"; [[ -n "$M" ]] && { echo 0 >"$STATE/fails"; rm -f "$STATE/cap-notified"; log recovered; echo status=recovered; exit 10; }
+  sleep 1
+done
+log FAILED; notify "Could not relaunch $GBW_APP_NAME."; echo status=failed >&2; exit 5
