@@ -32,7 +32,7 @@ trap 'rmdir "$LOCK"' EXIT
 main_pid()   { pgrep -f "^$APP_PATH/Contents/MacOS/" | while read -r p; do ps -o command= -p "$p" | grep -q -- '--type=' || { echo "$p"; break; }; done; }
 daemon_up()  { local m="$1"; pgrep -f 'local-exec-daemon' >/dev/null && return 0
                [[ -n "$m" ]] && pgrep -P "$m" -f 'node.mojom.NodeService' >/dev/null; }
-game_running() { [[ "${GBW_GAME_GUARD:-1}" == 1 ]] && pgrep -if "${GBW_GAME_MATCH:-steam_osx.*AppId|SteamLaunch}" >/dev/null; }
+game_running() { [[ "${GBW_GAME_GUARD:-1}" == 1 ]] && pgrep -if "${GBW_GAME_MATCH:-^[^ ]*/reaper SteamLaunch |vrserver|vrcompositor}" >/dev/null; }
 
 M="$(main_pid)"
 if [[ -n "$M" ]] && daemon_up "$M"; then echo 0 >"$STATE/fails"; echo "status=ok main=$M"; exit 0; fi

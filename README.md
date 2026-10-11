@@ -80,7 +80,7 @@ macOS (**untested**): `./macos/install.sh` installs a LaunchAgent that runs
 - Daemon detection is a heuristic based on process layout; an app update
   can change it. The daemon could also be alive but wedged (not detected).
 - The daemon lives inside the app, so recovery restarts the whole app.
-- The game guard is pattern-based (`GBW_GAME_MATCH`); it errs on the side
+- The game guard is pattern-based (`GBW_GAME_PROCS`, `GBW_GAME_MATCH`); it errs on the side
   of not restarting.
 - Only the user's own session; multi-seat setups are not handled.
 - The macOS version has not been tested on real hardware.

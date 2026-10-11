@@ -46,7 +46,8 @@ CONF="${GBW_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/grok-bot-watchdog/config}"
 : "${GBW_TERM_WAIT:=10}"                  # seconds between SIGTERM and SIGKILL
 : "${GBW_SETTLE:=20}"                     # seconds to wait for daemon after launch
 : "${GBW_GAME_GUARD:=1}"                  # skip relaunch while a game runs
-: "${GBW_GAME_MATCH:=reaper SteamLaunch|gamescope|vrserver|vrcompositor|steam_app_[0-9]}"
+: "${GBW_GAME_PROCS:=gamescope|vrserver|vrcompositor}"   # exact process names
+: "${GBW_GAME_MATCH:=^[^ ]*/reaper SteamLaunch }"         # cmdline regex (anchored)
 : "${GBW_RELAUNCH_IF_MAIN_DOWN:=1}"       # 0 = leave app-down to another launcher
 
 STATE="${XDG_STATE_HOME:-$HOME/.local/state}/grok-bot-watchdog"
@@ -169,7 +170,8 @@ discover_session() {
 
 game_running() {
   (( GBW_GAME_GUARD )) || return 1
-  pgrep -u "$UID_" -f -- "$GBW_GAME_MATCH" >/dev/null 2>&1
+  pgrep -u "$UID_" -x -- "$GBW_GAME_PROCS" >/dev/null 2>&1 ||
+    pgrep -u "$UID_" -f -- "$GBW_GAME_MATCH" >/dev/null 2>&1
 }
 
 push_env_to_manager() {
