@@ -1,0 +1,9 @@
+# ~/.config/grok-bot-watchdog/config  (sourced by grok-bot-ensure; all optional)
+#GBW_APP_BIN="/opt/Grok Bot/grok-bot"
+#GBW_LAUNCH_CMD="hyprctl dispatch exec grok-bot"   # use your compositor's launcher
+#GBW_DEBOUNCE=2            # consecutive bad checks before acting
+#GBW_CAP=3                 # max relaunches per GBW_CAP_WINDOW seconds
+#GBW_CAP_WINDOW=3600
+#GBW_GAME_GUARD=1          # don't restart the app while a game is running
+#GBW_GAME_MATCH="reaper SteamLaunch|gamescope|vrserver|vrcompositor|steam_app_[0-9]"
+#GBW_RELAUNCH_IF_MAIN_DOWN=1   # set 0 if something else already relaunches the app

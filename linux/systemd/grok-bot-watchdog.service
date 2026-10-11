@@ -1,0 +1,14 @@
+[Unit]
+Description=Grok Bot local-exec watchdog (community, unofficial)
+Documentation=https://github.com/OWNER/grok-bot-watchdog
+After=graphical-session.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/grok-bot-ensure
+# 10 = recovered, 11 = deferred (debounce / game running / paused / cap)
+SuccessExitStatus=10 11
+# Only the check runs in this unit; the app is launched in its own scope.
+KillMode=process
+TimeoutStartSec=120
+Nice=10

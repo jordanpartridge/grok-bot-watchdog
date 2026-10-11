@@ -1,0 +1,15 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: shellcheck -x linux/grok-bot-ensure linux/install.sh macos/grok-bot-ensure-macos macos/install.sh
+      - name: smoke (no app installed -> exit 4)
+        run: |
+          set +e; GBW_APP_BIN=/nonexistent linux/grok-bot-ensure --check; rc=$?
+          test "$rc" -eq 4
+      - name: plist lint
+        run: python3 -c "import plistlib;plistlib.load(open('macos/com.github.grok-bot-watchdog.plist','rb'))"
