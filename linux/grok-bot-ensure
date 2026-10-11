@@ -105,16 +105,17 @@ COMM="$(basename "$APP" | cut -c1-15)"
 dbg "app=$APP"
 
 # Is PID an instance of $APP? Compare the real executable; when /proc/PID/exe
-# is unreadable (e.g. inside the hardened unit's user namespace) require argv[0]
-# to equal $APP exactly. Substring matches never count, so an editor or pager
-# showing the path is never mistaken for the app.
+# is unreadable (e.g. inside the hardened unit's user namespace) require the
+# command line to BEGIN with "$APP" followed by a space/NUL or the end (Electron
+# rewrites argv into one space-joined string). Substring matches never count,
+# so an editor or pager showing the path is never mistaken for the app.
 is_app() {
-  local exe a0=""
+  local exe c
   if exe="$(readlink "/proc/$1/exe" 2>/dev/null)"; then
     [[ "$exe" == "$APP" ]]; return
   fi
-  IFS= read -r -d '' a0 <"/proc/$1/cmdline" 2>/dev/null
-  [[ "$a0" == "$APP" ]]
+  c="$(tr '\0' ' ' <"/proc/$1/cmdline" 2>/dev/null)"
+  [[ "$c" == "$APP" || "$c" == "$APP "* ]]
 }
 # All processes of THIS user that are the app (main + Chromium helpers).
 app_pids() {

@@ -21,8 +21,8 @@ daemon** has dropped and brings it back.
 
 1. **Find the app**: `/opt/Grok Bot/grok-bot` or `GBW_APP_BIN`. Processes
    are matched by owner and their real executable (`/proc/PID/exe`; inside
-   the hardened unit, where that link is unreadable, argv[0] must equal the
-   app path exactly), never by a command-line substring, so an editor or pager showing the path never counts.
+   the hardened unit, where that link is unreadable, the command line must
+   start with the exact app path), never by a command-line substring, so an editor or pager showing the path never counts.
 2. **Health check**: main process = app executable without a Chromium
    `--type=` flag. The daemon is the specific `node.mojom.NodeService`
    child that carries a local-exec marker: it has child processes (the
