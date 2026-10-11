@@ -52,7 +52,7 @@ if [[ -r "$CONF" ]]; then . "$CONF" || { echo "bad config: $CONF" >&2; exit 2; }
 : "${GBW_DAEMON_FD_MARKER:=/terminals/[0-9]+\.txt$}"  # regex for files the daemon holds open
 : "${GBW_LAUNCH_CMD:=}"                   # custom launch command (run via sh -c)
 : "${GBW_RELAUNCH_IF_MAIN_DOWN:=0}"       # 1 = also start the app when it is not running
-: "${GBW_DAEMON_DOWN_ACTION:=relaunch}"   # relaunch | notify
+: "${GBW_DAEMON_DOWN_ACTION:=notify}"     # notify | relaunch
 : "${GBW_DEBOUNCE:=2}"                    # consecutive unhealthy checks before acting
 : "${GBW_BACKOFF_BASE:=300}"              # seconds; doubles with each recent relaunch
 : "${GBW_CAP:=3}"                         # max relaunches per window
@@ -396,8 +396,17 @@ else
     echo "status=ok_idle main=$MAIN daemon=$i_d (identified earlier, alive, idle)"
     exit 0
   fi
+  # Recorded daemon is gone. If the app still has any NodeService child, the
+  # daemon was most likely restarted inside the app (new PID, idle, no marker
+  # yet): forget the old identity and treat it as unidentified. None of those
+  # children had a marker, otherwise probe() would have adopted it above.
+  if (( NS_COUNT > 0 )); then
+    (( RO )) || { rm -f "$ID_F"; echo 0 >"$FAILS_F"; }
+    echo "status=ok_idle main=$MAIN daemon=unidentified (recorded daemon $i_d gone; $NS_COUNT other NodeService child(ren) present)"
+    exit 0
+  fi
   reason=daemon_down
-  log "daemon pid $i_d (recorded for main $MAIN) is gone or its PID was reused"
+  log "daemon pid $i_d (recorded for main $MAIN) is gone and the app has no NodeService children"
 fi
 (( CHECK )) && { echo "status=unhealthy reason=$reason"; exit 1; }
 

@@ -174,8 +174,14 @@ if [[ -n "$M" ]]; then
     (( RO )) || echo 0 >"$STATE/fails"
     echo "status=ok_idle main=$M daemon=$i_d (identified earlier, alive, idle)"; exit 0
   fi
+  # Recorded daemon gone but other NodeService children exist: likely restarted
+  # inside the app and idle. Forget the identity; treat as unidentified.
+  if (( NS > 0 )); then
+    (( RO )) || { rm -f "$ID_F"; echo 0 >"$STATE/fails"; }
+    echo "status=ok_idle main=$M daemon=unidentified (recorded daemon $i_d gone; $NS other NodeService child(ren) present)"; exit 0
+  fi
   reason=daemon_down
-  log "daemon pid $i_d (recorded for main $M) is gone or its PID was reused"
+  log "daemon pid $i_d (recorded for main $M) is gone and the app has no NodeService children"
 else
   reason=app_down
 fi

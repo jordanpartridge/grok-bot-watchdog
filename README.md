@@ -35,14 +35,18 @@ daemon** has dropped and brings it back.
    - no marker (an idle daemon has none) -> `ok_idle`, nothing is touched,
      as long as the recorded daemon process still exists with the same
      start time.
-   - **daemon down** only when the recorded daemon process is gone, or its
-     PID now belongs to a process with a different start time, while the
-     same main instance is still running. Before the daemon has been
+   - recorded daemon gone (or its PID reused) but the app still has any
+     NodeService child -> the daemon was probably restarted inside the app
+     and is idle: the old identity is cleared, status `ok_idle`
+     (unidentified); a child with a marker is adopted as the new daemon.
+   - **daemon down** only when the recorded daemon process is gone AND the
+     same main instance has no NodeService children at all. Before the daemon has been
      positively identified for the current main instance it is never
      called down. Extra NodeService children coming and going are ignored;
      there is no count-based logic.
-   - what happens then is `GBW_DAEMON_DOWN_ACTION`: `relaunch` (Linux
-     default) or `notify` (one desktop notification, no restart).
+   - what happens then is `GBW_DAEMON_DOWN_ACTION`: `notify` (default on
+     both platforms: one desktop notification, no restart) or `relaunch`
+     (restart the app, with all guards, debounce, backoff and cap).
    - after a relaunch, a new main process with a NodeService child counts
      as recovered; the fresh daemon's identity is recorded on a later run,
      once it shows a marker.
@@ -120,9 +124,9 @@ macOS: `./macos/install.sh` installs a LaunchAgent running
 `grok-bot-ensure-macos` every 300 s (pgrep/lsof detection, `open -g -a`,
 same guards, cap and backoff; logs in `~/Library/Logs/grok-bot-watchdog`, trimmed to the last 1000
 lines on each run; config template `macos/config.example`).
-Same identity tracking. When the daemon drops it only **notifies** by
-default (`GBW_DAEMON_DOWN_ACTION=notify`); set it to `relaunch` to quit and
-reopen the app. It starts a missing app only when opted in. Its game
+Same identity tracking and the same default: when the daemon drops it only
+**notifies** (`GBW_DAEMON_DOWN_ACTION=notify`); set it to `relaunch` to
+quit and reopen the app. It starts a missing app only when opted in. Its game
 guard also covers Steam games (`steamapps/common`), Wine/CrossOver/Whisky
 and common launchers; the Sunshine log is `~/.config/sunshine/sunshine.log`
 on macOS as well.
