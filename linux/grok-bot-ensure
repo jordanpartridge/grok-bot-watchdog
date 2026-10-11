@@ -63,6 +63,7 @@ if [[ -r "$CONF" ]]; then . "$CONF" || { echo "bad config: $CONF" >&2; exit 2; }
 : "${GBW_SUNSHINE_LOG:=${XDG_CONFIG_HOME:-$HOME/.config}/sunshine/sunshine.log}"
 : "${GBW_STREAM_PORTS:=47998|47999|48000|48002|48010}"   # Sunshine/GameStream UDP/TCP
 : "${GBW_NOTIFY:=1}"
+: "${GBW_BLOCK_NOTIFY:=1800}"             # notify once when a guard blocks longer than this
 
 UID_="$(id -u)"
 mkdir -p "$STATE"
@@ -161,26 +162,49 @@ game_running() {
   pgrep -u "$UID_" -x -- "$GBW_GAME_PROCS" >/dev/null 2>&1 ||
     pgrep -u "$UID_" -f -- "$GBW_GAME_MATCH" >/dev/null 2>&1
 }
-# An active Sunshine stream: the last connect/disconnect line in its log is a
-# connect, or a stream port has an established/connected peer with queued data.
+# An active Sunshine stream. Sunshine itself runs all the time, so require:
+# sunshine is running for this user, its log was written after it started
+# (not a stale log from an earlier run), and the last connect/disconnect line
+# is a connect. Or: a stream port has an established/connected peer.
+proc_start_epoch() {  # wall-clock start time of PID (via ps etimes)
+  local e; e="$(ps -o etimes= -p "$1" 2>/dev/null | tr -d ' ')"
+  [[ "$e" =~ ^[0-9]+$ ]] && echo $(( $(date +%s) - e ))
+}
 stream_active() {
   (( GBW_STREAM_GUARD )) || return 1
-  local last
+  local sp st mt last
+  sp="$(pgrep -u "$UID_" -x sunshine 2>/dev/null | head -1)"
+  [[ -n "$sp" ]] || sp="$(pgrep -x sunshine 2>/dev/null | head -1)"
+  [[ -n "$sp" ]] || return 1
   if [[ -r "$GBW_SUNSHINE_LOG" ]]; then
-    last="$(grep -a -E 'CLIENT (DIS)?CONNECTED' "$GBW_SUNSHINE_LOG" 2>/dev/null | tail -1)"
-    [[ "$last" == *"CLIENT CONNECTED"* ]] && return 0
+    st="$(proc_start_epoch "$sp")"; mt="$(stat -c %Y "$GBW_SUNSHINE_LOG" 2>/dev/null)"
+    if [[ -n "$st" && -n "$mt" ]] && (( mt >= st )); then
+      last="$(grep -a -E 'CLIENT (DIS)?CONNECTED' "$GBW_SUNSHINE_LOG" 2>/dev/null | tail -1)"
+      [[ "$last" == *"CLIENT CONNECTED"* ]] && return 0
+    fi
   fi
   command -v ss >/dev/null 2>&1 || return 1
+  # With a state filter ss prints no State column:
+  #   Netid Recv-Q Send-Q Local:Port Peer:Port
   ss -Htun state established 2>/dev/null |
-    awk -v re=":($GBW_STREAM_PORTS)\$" '$4 ~ re || $3 ~ re {found=1} END{exit !found}' && return 0
-  ss -Hun 2>/dev/null |
-    awk -v re=":($GBW_STREAM_PORTS)\$" '($4 ~ re) && $5 !~ /\*$/ {found=1} END{exit !found}'
+    awk -v re=":($GBW_STREAM_PORTS)\$" '$4 ~ re || $5 ~ re {found=1} END{exit !found}'
 }
 # Returns 0 (and prints why) if a relaunch must not happen right now.
+# Notifies once if a guard has been blocking for more than GBW_BLOCK_NOTIFY s.
 guard_blocks() {
-  if game_running;  then echo game_running;  return 0; fi
-  if stream_active; then echo stream_active; return 0; fi
-  return 1
+  local why="" since
+  if game_running; then why=game_running
+  elif stream_active; then why=stream_active; fi
+  if [[ -z "$why" ]]; then rm -f "$STATE/blocked-since" "$STATE/blocked-notified"; return 1; fi
+  if (( ! DRY )); then
+    [[ -s "$STATE/blocked-since" ]] || date +%s >"$STATE/blocked-since"
+    since="$(cat "$STATE/blocked-since" 2>/dev/null)"
+    if [[ "$since" =~ ^[0-9]+$ ]] && (( $(date +%s) - since > GBW_BLOCK_NOTIFY )) && [[ ! -e "$STATE/blocked-notified" ]]; then
+      notify "Local-exec daemon is down but a relaunch has been held off for over $(( GBW_BLOCK_NOTIFY / 60 )) min ($why)."
+      touch "$STATE/blocked-notified"
+    fi
+  fi
+  echo "$why"
 }
 
 # ---- session discovery (works from SSH / systemd with an empty env) ----------
@@ -247,8 +271,15 @@ push_env_to_manager() {
   fi
 }
 
+# Called only after the guards passed; the attempt is counted toward the
+# cap/backoff right here, when a launch is actually made.
+record_relaunch() {
+  date +%s >>"$STATE/relaunches"
+  tail -n 20 "$STATE/relaunches" >"$STATE/relaunches.tmp" && mv "$STATE/relaunches.tmp" "$STATE/relaunches"
+}
 launch_app() {
   if [[ -n "$GBW_LAUNCH_CMD" ]]; then
+    record_relaunch
     sh -c "$GBW_LAUNCH_CMD" >>"$STATE/app.log" 2>&1 </dev/null
     return
   fi
@@ -261,9 +292,16 @@ launch_app() {
     # Started by the user manager as its own unit: outside this service's
     # sandbox, and stopping the watchdog never takes the app down.
     for v in "${SESSION_VARS[@]}"; do [[ -n "${!v:-}" ]] && envs+=("--setenv=$v=${!v}"); done
+    record_relaunch
     systemd-run --user --quiet --collect --unit="grok-bot-app-$(date +%s)" \
       -p KillMode=process "${envs[@]}" -- "$APP" "${flags[@]}" >>"$STATE/app.log" 2>&1
+  elif [[ -n "${INVOCATION_ID:-}" ]]; then
+    # Inside a systemd unit (the hardened watchdog service): a setsid child
+    # would inherit its read-only sandbox, so refuse instead.
+    log "refuse: no user manager for systemd-run and running inside a unit sandbox; set GBW_LAUNCH_CMD"
+    return 1
   else
+    record_relaunch
     setsid "$APP" "${flags[@]}" >>"$STATE/app.log" 2>&1 </dev/null &
     disown 2>/dev/null || true
   fi
@@ -295,10 +333,15 @@ probe() {
   done
   [[ -n "$DAEMON" ]]
 }
+# After a relaunch the new daemon is usually idle (no shells yet, so no
+# marker). Accept a NEW main process (different from OLD_MAIN) whose
+# NodeService children reach the previous instance's baseline count.
 wait_healthy() {
-  local i
+  local i want="${b_count:-1}"
+  [[ "$want" =~ ^[1-9][0-9]*$ ]] || want=1
   for ((i = 0; i < GBW_SETTLE; i++)); do
     probe && return 0
+    [[ -n "$MAIN" && "$MAIN" != "${OLD_MAIN:-}" ]] && (( NS_COUNT >= want )) && return 0
     sleep 1
   done
   return 1
@@ -306,8 +349,16 @@ wait_healthy() {
 
 # ---- health check -------------------------------------------------------------
 FAILS_F="$STATE/fails" BASE_F="$STATE/nodeservice-baseline"
+# Start time of PID in clock ticks since boot: /proc/PID/stat field 22
+# (parsed after the ")" that ends the comm field, which may contain spaces).
+proc_starttime() {
+  local s; s="$(cat "/proc/$1/stat" 2>/dev/null)" || return 1
+  s="${s##*) }"; read -r -a f <<<"$s"; echo "${f[19]}"
+}
 if probe; then
-  echo 0 >"$FAILS_F"; echo "$NS_COUNT" >"$BASE_F"; rm -f "$STATE/cap-notified"
+  echo 0 >"$FAILS_F"; rm -f "$STATE/cap-notified"
+  # baseline line: <nodeservice count> <main pid> <main starttime>
+  [[ -n "$MAIN" ]] && echo "$NS_COUNT $MAIN $(proc_starttime "$MAIN")" >"$BASE_F"
   echo "status=ok main=$MAIN daemon=$DAEMON via=$HOW"
   exit 0
 fi
@@ -318,7 +369,12 @@ else
   # No marker right now. The daemon can be idle (no shells, no open files),
   # so only call it down if the app lost a NodeService child since the last
   # time the daemon was positively identified.
-  base="$(cat "$BASE_F" 2>/dev/null || echo 0)"
+  # The baseline only applies to the same app instance (pid + start time).
+  base=0; read -r b_count b_pid b_start <"$BASE_F" 2>/dev/null || true
+  if [[ "${b_count:-}" =~ ^[0-9]+$ && "${b_pid:-}" == "$MAIN" && -n "${b_start:-}" &&
+        "$b_start" == "$(proc_starttime "$MAIN")" ]]; then
+    base=$b_count
+  fi
   if (( base == 0 || NS_COUNT >= base )); then
     echo 0 >"$FAILS_F"
     echo "status=ok_idle main=$MAIN nodeservice=$NS_COUNT baseline=$base (no marker; no evidence of a drop)"
@@ -386,8 +442,7 @@ if (( DRY )); then
   exit 12
 fi
 
-echo "$now" >>"$STATE/relaunches"
-tail -n 20 "$STATE/relaunches" >"$STATE/relaunches.tmp" && mv "$STATE/relaunches.tmp" "$STATE/relaunches"
+OLD_MAIN="$MAIN"
 push_env_to_manager
 log "recover: reason=$reason session=$SESSION"
 
@@ -398,7 +453,7 @@ if [[ "$reason" == daemon_down ]]; then
 fi
 if [[ -z "$(main_pids)" ]]; then
   if why="$(guard_blocks)"; then log "abort before launch: $why"; echo "status=deferred reason=$why"; exit 11; fi
-  launch_app
+  launch_app || { echo "status=failed reason=launch_refused" >&2; exit 5; }
 fi
 if wait_healthy; then
   echo 0 >"$FAILS_F"; log "recovered (tier1)"; echo "status=recovered reason=$reason"; exit 10
@@ -411,7 +466,7 @@ mapfile -t all < <(app_pids)
 ((${#all[@]})) && kill -KILL "${all[@]}" 2>/dev/null
 sleep 2
 if why="$(guard_blocks)"; then log "abort before launch: $why"; echo "status=deferred reason=$why"; exit 11; fi
-launch_app
+launch_app || { echo "status=failed reason=launch_refused" >&2; exit 5; }
 if wait_healthy; then
   echo 0 >"$FAILS_F"; log "recovered (tier2 hard)"; echo "status=recovered reason=$reason tier=hard"; exit 10
 fi

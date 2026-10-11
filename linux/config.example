@@ -19,3 +19,4 @@
 #GBW_SUNSHINE_LOG="$HOME/.config/sunshine/sunshine.log"
 #GBW_STREAM_PORTS="47998|47999|48000|48002|48010"
 #GBW_NOTIFY=1
+#GBW_BLOCK_NOTIFY=1800              # notify once if a guard blocks a needed relaunch this long

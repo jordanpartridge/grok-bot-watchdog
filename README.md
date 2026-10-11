@@ -30,15 +30,24 @@ daemon** has dropped and brings it back.
    (`GBW_DAEMON_FD_MARKER`). For builds that run a standalone daemon, set
    `GBW_DAEMON_MATCH`.
    - marker found -> **healthy, nothing is touched**; the number of
-     NodeService children is remembered as a baseline;
+     NodeService children is remembered as a baseline together with the
+     main PID and its start time (`/proc/PID/stat` field 22);
    - no marker but no NodeService child lost since the baseline ->
      `ok_idle`, nothing is touched (an idle daemon has no marker);
-   - fewer NodeService children than the baseline -> daemon down.
+   - fewer NodeService children than the baseline **of the same app
+     instance** (PID and start time match) -> daemon down. A baseline from
+     an earlier instance is ignored.
+   - after a relaunch, a new main process whose NodeService children reach
+     the previous count counts as recovered (the fresh daemon is idle).
 3. **Guards** before any action: pause files, debounce (2 bad checks),
    game guard (gamescope / SteamVR / a Steam game launched via `reaper`),
-   stream guard (an active Sunshine client per its log, or a connected peer
-   on the stream ports), exponential backoff (300 s, doubling), and a cap of
-   3 relaunches per hour with a desktop notification when it is hit. The
+   stream guard (Sunshine running, its log written since Sunshine started,
+   and the last client event in it is a connect; or an established peer on
+   the stream ports), exponential backoff (300 s, doubling), and a cap of
+   3 relaunches per hour with a desktop notification when it is hit. If a
+   guard holds off a needed relaunch for more than 30 min
+   (`GBW_BLOCK_NOTIFY`), you get one notification. A relaunch is counted
+   toward the cap only when a launch is actually attempted. The
    game/stream guard is re-checked right before the graceful stop, before
    the tier-2 SIGKILL, and before every launch.
 4. **App not running**: left alone by default (`GBW_RELAUNCH_IF_MAIN_DOWN=0`).
@@ -51,7 +60,10 @@ daemon** has dropped and brings it back.
 6. **Recovery**: push the session env into the user manager; tier 1 =
    SIGTERM, wait, relaunch; tier 2 = SIGKILL the app tree, relaunch. The app
    is started with `systemd-run --user` (or `GBW_LAUNCH_CMD`), so it never
-   inherits the watchdog's sandbox and outlives it.
+   inherits the watchdog's sandbox and outlives it. Without a reachable
+   user manager the script falls back to `setsid`, but **refuses** that when
+   `INVOCATION_ID` is set (it is running inside a systemd unit, whose
+   read-only sandbox the app would inherit); set `GBW_LAUNCH_CMD` instead.
 
 ### Exit codes
 
@@ -98,8 +110,11 @@ access only to its state dir), `ProtectKernelTunables` and
 macOS (**untested**): `./macos/install.sh` installs a LaunchAgent running
 `grok-bot-ensure-macos` every 300 s (pgrep/lsof detection, `open -g -a`,
 same guards, cap and backoff; logs in `~/Library/Logs/grok-bot-watchdog`).
-On macOS it only relaunches an app that is not running (opt-in), since a
-daemon-only restart has not been validated there.
+It restarts the app when the daemon drops (same marker + per-instance
+baseline logic), and starts a missing app only when opted in. Its game
+guard also covers Steam games (`steamapps/common`), Wine/CrossOver/Whisky
+and common launchers; the Sunshine log is `~/.config/sunshine/sunshine.log`
+on macOS as well.
 
 ## Uninstall
 
@@ -117,8 +132,15 @@ daemon-only restart has not been validated there.
   NodeService child compared with the last positive identification.
 - The daemon lives inside the app, so recovery restarts the whole app.
 - Game/stream guards are pattern-based and err on the side of not acting.
-- Inside the hardened unit the open-file marker may be unreadable; the
-  child-process marker and the NodeService baseline still work.
+- Inside the hardened unit (systemd puts it in a user namespace),
+  `/proc/PID/exe`, `/proc/PID/fd/*` links and `/proc/PID/environ` of the
+  app may be unreadable. Fallbacks: the app is identified by a command line
+  that starts with the exact app path; the daemon by its child processes
+  (the open-file marker is then skipped) and the per-instance NodeService
+  baseline; session variables come from compositor sockets under
+  `/run/user/$UID`, `/tmp/.X11-unix` and `loginctl` instead of a donor
+  process's environment. Run `grok-bot-ensure -v` outside the unit to see
+  every signal.
 - Single-user, single-session only. The macOS version is untested.
 
 ## License
