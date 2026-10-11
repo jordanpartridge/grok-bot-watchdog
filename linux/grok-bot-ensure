@@ -110,7 +110,7 @@ discover_session() {
 
   # 1) borrow env from a live process already in the graphical session
   local donor="" d
-  for d in "$(main_pids | head -1)" \
+  for d in "$(main_pids 2>/dev/null | head -1)" \
            $(pgrep -u "$UID_" -x 'Hyprland|gnome-shell|kwin_wayland|kwin_x11|plasmashell|sway|xfce4-session|mutter' 2>/dev/null); do
     [[ -n "$d" && -r "/proc/$d/environ" ]] && { donor="$d"; break; }
   done
@@ -222,7 +222,7 @@ stop_app() {
 wait_healthy() {
   local i m
   for ((i = 0; i < GBW_SETTLE; i++)); do
-    m="$(main_pids | head -1)"
+    m="$(main_pids 2>/dev/null | head -1)"
     [[ -n "$m" && -n "$(daemon_pids "$m")" ]] && return 0
     sleep 1
   done
@@ -230,8 +230,8 @@ wait_healthy() {
 }
 
 # ---- health check -----------------------------------------------------------------
-MAIN="$(main_pids | head -1)"
-DAEMON="$(daemon_pids "$MAIN" | head -1)"
+MAIN="$(main_pids 2>/dev/null | head -1)"
+DAEMON="$(daemon_pids "$MAIN" 2>/dev/null | head -1)"
 FAILS_F="$STATE/fails"
 
 if [[ -n "$MAIN" && -n "$DAEMON" ]]; then
