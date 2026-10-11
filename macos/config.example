@@ -4,6 +4,7 @@
 #GBW_PAUSE_FILES="$HOME/.config/grok-bot-watchdog/PAUSE:$HOME/Library/Application Support/grok-bot-watchdog/PAUSE"
 #GBW_APP_NAME="Grok Bot"
 #GBW_APP_PATH="/Applications/Grok Bot.app"
+#GBW_DAEMON_DOWN_ACTION=notify          # daemon gone, app up: relaunch | notify
 #GBW_RELAUNCH_IF_MAIN_DOWN=0        # 1 = also start the app if it is not running at all
 #GBW_DAEMON_FD_MARKER='/terminals/[0-9]+\.txt$'
 #GBW_DEBOUNCE=2

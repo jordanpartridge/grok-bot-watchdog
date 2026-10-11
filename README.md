@@ -29,18 +29,23 @@ daemon** has dropped and brings it back.
    shells it runs) or holds a terminal-output file open
    (`GBW_DAEMON_FD_MARKER`). For builds that run a standalone daemon, set
    `GBW_DAEMON_MATCH`.
-   - marker found -> **healthy, nothing is touched**; the number of
-     NodeService children is remembered as a baseline together with the
-     main PID and its start time (`/proc/PID/stat` field 22). The baseline
-     is the most children seen for that instance and is updated on every
-     run while the app is up, busy or idle;
-   - no marker but no NodeService child lost since the baseline ->
-     `ok_idle`, nothing is touched (an idle daemon has no marker);
-   - fewer NodeService children than the baseline **of the same app
-     instance** (PID and start time match) -> daemon down. A baseline from
-     an earlier instance is ignored.
-   - after a relaunch, a new main process whose NodeService children reach
-     the previous count counts as recovered (the fresh daemon is idle).
+   - marker found -> **healthy, nothing is touched**. That process's
+     identity is recorded: its PID and start time (`/proc/PID/stat` field
+     22), scoped to the main process's PID and start time.
+   - no marker (an idle daemon has none) -> `ok_idle`, nothing is touched,
+     as long as the recorded daemon process still exists with the same
+     start time.
+   - **daemon down** only when the recorded daemon process is gone, or its
+     PID now belongs to a process with a different start time, while the
+     same main instance is still running. Before the daemon has been
+     positively identified for the current main instance it is never
+     called down. Extra NodeService children coming and going are ignored;
+     there is no count-based logic.
+   - what happens then is `GBW_DAEMON_DOWN_ACTION`: `relaunch` (Linux
+     default) or `notify` (one desktop notification, no restart).
+   - after a relaunch, a new main process with a NodeService child counts
+     as recovered; the fresh daemon's identity is recorded on a later run,
+     once it shows a marker.
 3. **Guards** before any action: pause files, debounce (2 bad checks),
    game guard (gamescope / SteamVR / a Steam game launched via `reaper`),
    stream guard (Sunshine running, its log written since Sunshine started,
@@ -115,8 +120,9 @@ macOS: `./macos/install.sh` installs a LaunchAgent running
 `grok-bot-ensure-macos` every 300 s (pgrep/lsof detection, `open -g -a`,
 same guards, cap and backoff; logs in `~/Library/Logs/grok-bot-watchdog`, trimmed to the last 1000
 lines on each run; config template `macos/config.example`).
-It restarts the app when the daemon drops (same marker + per-instance
-baseline logic), and starts a missing app only when opted in. Its game
+Same identity tracking. When the daemon drops it only **notifies** by
+default (`GBW_DAEMON_DOWN_ACTION=notify`); set it to `relaunch` to quit and
+reopen the app. It starts a missing app only when opted in. Its game
 guard also covers Steam games (`steamapps/common`), Wine/CrossOver/Whisky
 and common launchers; the Sunshine log is `~/.config/sunshine/sunshine.log`
 on macOS as well.
@@ -136,16 +142,17 @@ on macOS as well.
 
 - Daemon detection is a heuristic based on process layout; an app update
   can change it. A daemon that is alive but wedged is not detected.
-- An idle daemon with no marker is only declared down if the app loses a
-  NodeService child compared with the last positive identification.
+- A drop is only detectable after the daemon has shown a marker once for
+  the current app instance (shells running or terminal files open). If it
+  dies before ever being identified, the watchdog stays `ok_idle`.
 - The daemon lives inside the app, so recovery restarts the whole app.
 - Game/stream guards are pattern-based and err on the side of not acting.
 - Inside the hardened unit (systemd puts it in a user namespace),
   `/proc/PID/exe`, `/proc/PID/fd/*` links and `/proc/PID/environ` of the
   app may be unreadable. Fallbacks: the app is identified by a command line
   that starts with the exact app path; the daemon by its child processes
-  (the open-file marker is then skipped) and the per-instance NodeService
-  baseline; session variables come from compositor sockets under
+  (the open-file marker is then skipped); the recorded identity check
+  only needs `/proc/PID/stat`, which stays readable; session variables come from compositor sockets under
   `/run/user/$UID`, `/tmp/.X11-unix` and `loginctl` instead of a donor
   process's environment. Run `grok-bot-ensure -v` outside the unit to see
   every signal.

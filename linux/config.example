@@ -5,6 +5,7 @@
 #GBW_APP_BIN="/opt/Grok Bot/grok-bot"
 #GBW_APP_DATA="$HOME/.config/Grok Bot"
 #GBW_LAUNCH_CMD=""                  # e.g. your compositor's exec dispatcher
+#GBW_DAEMON_DOWN_ACTION=relaunch          # daemon gone, app up: relaunch | notify
 #GBW_RELAUNCH_IF_MAIN_DOWN=0        # 1 = also start the app if it is not running at all
 #GBW_DAEMON_MATCH=""                # regex for a standalone daemon process (older builds)
 #GBW_DAEMON_FD_MARKER='/terminals/[0-9]+\.txt$'

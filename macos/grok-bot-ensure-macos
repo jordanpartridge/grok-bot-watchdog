@@ -8,6 +8,8 @@
 # 12 dry-run, 2 usage, 4 app not found, 5 failed, 6 locked, 7 host mismatch;
 # --check: 0 healthy, 1 not healthy. Paused exits 0.
 # --check and --dry-run are read-only: no lock, no state writes.
+# Daemon down (app still running): GBW_DAEMON_DOWN_ACTION=notify (default on
+# macOS) only posts a notification; =relaunch quits and reopens the app.
 set -uo pipefail
 DRY=0 FORCE=0 CHECK=0
 for a in "$@"; do
@@ -15,7 +17,7 @@ for a in "$@"; do
     --dry-run|-n) DRY=1 ;;
     --check) CHECK=1 ;;
     --force) FORCE=1 ;;
-    -h|--help) sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$0"; exit 0 ;;
     *) echo "unknown arg: $a" >&2; exit 2 ;;
   esac
 done
@@ -30,6 +32,7 @@ LOGDIR="$HOME/Library/Logs/grok-bot-watchdog"
 : "${GBW_APP_NAME:=Grok Bot}"
 : "${GBW_APP_PATH:=/Applications/$GBW_APP_NAME.app}"
 : "${GBW_RELAUNCH_IF_MAIN_DOWN:=0}"
+: "${GBW_DAEMON_DOWN_ACTION:=notify}"   # notify | relaunch
 : "${GBW_DEBOUNCE:=2}" "${GBW_CAP:=3}" "${GBW_CAP_WINDOW:=3600}" "${GBW_BACKOFF_BASE:=300}"
 : "${GBW_TERM_WAIT:=10}" "${GBW_SETTLE:=30}" "${GBW_BLOCK_NOTIFY:=1800}"
 : "${GBW_GAME_GUARD:=1}"
@@ -128,7 +131,10 @@ guard_blocks() {
   local why="" since
   if (( GBW_GAME_GUARD )) && pgrep -U "$UID_" -f "$GBW_GAME_MATCH" >/dev/null; then why=game_running
   elif sunshine_streaming; then why=stream_active; fi
-  if [[ -z "$why" ]]; then rm -f "$STATE/blocked-since" "$STATE/blocked-notified"; return 1; fi
+  if [[ -z "$why" ]]; then
+    (( RO )) || rm -f "$STATE/blocked-since" "$STATE/blocked-notified"
+    return 1
+  fi
   if (( ! RO )); then
     [[ -s "$STATE/blocked-since" ]] || date +%s >"$STATE/blocked-since"
     since="$(cat "$STATE/blocked-since")"
@@ -141,32 +147,47 @@ guard_blocks() {
 record_relaunch() { date +%s >>"$STATE/relaunches"; tail -n 20 "$STATE/relaunches" >"$STATE/r.tmp" && mv "$STATE/r.tmp" "$STATE/relaunches"; }
 defer() { log "status=deferred reason=$1"; exit 11; }
 
-BASE_F="$STATE/nodeservice-baseline"
+# Identity tracking: once a NodeService child is positively identified as the
+# daemon (marker present) record <main pid> <main lstart> <daemon pid> <daemon lstart>.
+# With no marker visible later, the daemon is down only if THAT process is gone
+# (or its PID was reused) while the same main instance runs. Never before.
+ID_F="$STATE/daemon-identity"
 probe; healthy=$?
-# Baseline = most NodeService children seen for THIS instance (pid + lstart),
-# updated on every run while the app is up (busy or idle).
-base=0 b_count=""
-if [[ -n "$M" ]]; then
-  inst="$(instance_id "$M")"
-  if [[ -r "$BASE_F" ]]; then read -r b_count b_pid b_inst <"$BASE_F" || true; fi
-  [[ "${b_count:-}" =~ ^[0-9]+$ && "${b_pid:-}" == "$M" && -n "$inst" && "${b_inst:-}" == "$inst" ]] && base=$b_count
-  (( RO )) || echo "$(( NS > base ? NS : base )) $M $inst" >"$BASE_F"
-fi
+(( RO )) || rm -f "$STATE/nodeservice-baseline"   # obsolete count baseline
 if (( healthy == 0 )); then
-  (( RO )) || { echo 0 >"$STATE/fails"; rm -f "$STATE/cap-notified"; }
-  echo "status=ok main=$M daemon=$D nodeservice=$NS baseline=$base"; exit 0
+  if (( ! RO )); then
+    echo 0 >"$STATE/fails"; rm -f "$STATE/cap-notified" "$STATE/daemon-down-notified"
+    echo "$M $(instance_id "$M") $D $(instance_id "$D")" >"$ID_F"
+  fi
+  echo "status=ok main=$M daemon=$D"; exit 0
 fi
 if [[ -n "$M" ]]; then
-  b_count=$base
-  if (( base == 0 || NS >= base )); then
-    (( RO )) || echo 0 >"$STATE/fails"; echo "status=ok_idle main=$M nodeservice=$NS baseline=$base"; exit 0
+  i_main="" i_minst="" i_d="" i_dinst=""
+  if [[ -r "$ID_F" ]]; then read -r i_main i_minst i_d i_dinst <"$ID_F" || true; fi
+  m_inst="$(instance_id "$M")"
+  if [[ "$i_main" != "$M" || -z "$m_inst" || "$i_minst" != "$m_inst" || ! "$i_d" =~ ^[0-9]+$ ]]; then
+    (( RO )) || echo 0 >"$STATE/fails"
+    echo "status=ok_idle main=$M daemon=unidentified (no marker yet for this instance)"; exit 0
+  fi
+  d_inst="$(instance_id "$i_d")"
+  if [[ -n "$d_inst" && "$d_inst" == "$i_dinst" ]]; then
+    (( RO )) || echo 0 >"$STATE/fails"
+    echo "status=ok_idle main=$M daemon=$i_d (identified earlier, alive, idle)"; exit 0
   fi
   reason=daemon_down
+  log "daemon pid $i_d (recorded for main $M) is gone or its PID was reused"
 else
   reason=app_down
 fi
 (( CHECK )) && { echo "status=unhealthy reason=$reason"; exit 1; }
 [[ $reason == app_down && "$GBW_RELAUNCH_IF_MAIN_DOWN" != 1 ]] && defer app_down
+if [[ $reason == daemon_down && "$GBW_DAEMON_DOWN_ACTION" != relaunch ]]; then
+  if (( ! RO )) && [[ ! -e "$STATE/daemon-down-notified" ]]; then
+    notify "Grok Bot local-exec daemon is down (app still running). Restart the app to reconnect."
+    touch "$STATE/daemon-down-notified"
+  fi
+  defer "daemon_down action=notify"
+fi
 
 fails=$(( $(cat "$STATE/fails" 2>/dev/null || echo 0) + 1 ))
 (( DRY )) || echo "$fails" >"$STATE/fails"
@@ -189,7 +210,7 @@ if (( FORCE == 0 )); then
 fi
 (( DRY )) && { echo "dry-run: reason=$reason; would quit (if running) and 'open -g -a \"$GBW_APP_PATH\"'"; exit 12; }
 
-OLD="$M"; want="${b_count:-1}"; [[ "$want" =~ ^[1-9][0-9]*$ ]] || want=1
+OLD="$M"
 log "recover: $reason"
 if [[ $reason == daemon_down ]]; then
   if why="$(guard_blocks)"; then defer "$why"; fi
@@ -204,7 +225,7 @@ if why="$(guard_blocks)"; then defer "$why"; fi
 record_relaunch
 open -g -a "$GBW_APP_PATH"
 for ((i = 0; i < GBW_SETTLE; i++)); do
-  if probe || { [[ -n "$M" && "$M" != "$OLD" ]] && (( NS >= want )); }; then
+  if probe || { [[ -n "$M" && "$M" != "$OLD" ]] && (( NS >= 1 )); }; then
     echo 0 >"$STATE/fails"; rm -f "$STATE/cap-notified"; log recovered; echo status=recovered; exit 10
   fi
   sleep 1
